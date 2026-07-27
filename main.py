@@ -1,0 +1,49 @@
+import argparse, os, time, sys
+
+from loguru import logger
+from src.eventlab import update_cfg
+
+def eventlab(args):
+    # Check if dataset exists, if not download it
+    if not os.path.exists(f"{args.eventlab_dir}/{args.dataset}/{args.ref}") or not os.path.exists(f"{args.eventlab_dir}/{args.dataset}/{args.query}"):
+        logger.info("Running EventLAB data download.")
+        update_cfg(args)
+    else:
+        logger.info(f"Data exists at {args.eventlab_dir}/{args.dataset}")
+
+def main():
+
+    parser = argparse.ArgumentParser(description="Args for megaevent.")
+
+    # Inference parameters
+    parser.add_argument("--dataset", "-d", type=str, required=True, choices=["brisbane_event", "nsavp", "nycevent", "pitts", "tokyo"],
+                        help="Sets the dataset to be used for inference.")
+    parser.add_argument("--ref", "-r", type=str, required=True,
+                        help="Sets the reference dataset for inference.")
+    parser.add_argument("--query", "-q", type=str, required=True,
+                        help="Sets the query dataset for inference.")
+    parser.add_argument("--dt-ms", type=int, default=50,
+                        help="Sets the time window in milliseconds for inference.")
+    parser.add_argument("--model", "-m", type=str, default="s_salad_ft4", choices=["s_salad_ft4", "s_gem_ft4"],
+                        help="Sets the model to be used for inference.")
+    parser.add_argument("--feature-dir", type=str, default="./features",
+                        help="Sets the directory to save features.")
+    # Event-LAB args
+    parser.add_argument("--eventlab-dir", type=str, default="./data",
+                        help="Sets the Event-LAB default dataset directory.")
+
+    args = parser.parse_args()
+
+    # Add the log file
+    logger.remove()
+    logpath = f"./logs/{args.dataset}/{args.ref}_{args.query}"
+    if not os.path.exists(logpath):
+        os.makedirs(logpath)
+    logger.add(sys.stdout, colorize=True, format="<green>{time:%Y-%m-%d %H:%M:%S}</green> {message}", level="INFO")
+    logger.add(f"{logpath}/{time.strftime('%Y-%m-%d_%H-%M-%S')}.log")
+
+    # Update eventlab config and run data check
+    eventlab(args)
+
+if __name__ == "__main__":
+    main()

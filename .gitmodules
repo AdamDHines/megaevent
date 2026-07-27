@@ -1,3 +1,9 @@
 [submodule "external/backbone"]
 	path = external/backbone
 	url = https://github.com/uzh-rpg/generative_event_pretraining.git
+[submodule "external/eventlab"]
+	path = external/eventlab
+	url = https://github.com/EventLAB-Team/Event-LAB.git
+[submodule "external/vprtutorial"]
+	path = external/vprtutorial
+	url = https://github.com/stschubert/VPR_Tutorial.git
