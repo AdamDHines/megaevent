@@ -150,7 +150,7 @@ class EventStreamDataset(Dataset):
     """
 
     def __init__(self, dataset, traverse, path, transform, representation, dt_ms, sensor,
-                 hot_pixel=True, filter_dt_us=None, no_event_filter=None, event_filter_dt_ms=None):
+                 hot_pixel=True, filter_dt_us=None, no_event_filter=True, event_filter_dt_ms=None):
         self.dataset = dataset
         self.traverse = traverse
         self.path = path

@@ -7,8 +7,7 @@ from src.eventlab import update_cfg
 
 def eventlab(args):
     # Check if dataset exists, if not download it
-    if not os.path.exists(f"{args.eventlab_dir}/{args.dataset}/{args.ref}") or not os.path.exists(f"{args.eventlab_dir}/{args.dataset}/{args.query}"):
-        logger.info("Running EventLAB data download.")
+    if not os.path.exists(f"{args.eventlab_dir}/{args.dataset}/{args.ref}") or not os.path.exists(f"{args.eventlab_dir}/{args.dataset}/{args.query}") or not os.path.exists(f"{args.eventlab_dir}/{args.dataset}/ground_truth/{args.ref}_{args.query}_GT.npy"):
         update_cfg(args)
     else:
         logger.info(f"Data exists at {args.eventlab_dir}/{args.dataset}")
