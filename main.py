@@ -1,6 +1,7 @@
-import argparse, os, time, sys
+import argparse, os, time
 
 from loguru import logger
+from tqdm import tqdm
 from src.inference import run
 from src.eventlab import update_cfg
 
@@ -51,7 +52,11 @@ def main():
     logpath = f"./logs/{args.dataset}/{args.ref}_{args.query}"
     if not os.path.exists(logpath):
         os.makedirs(logpath)
-    logger.add(sys.stdout, colorize=True, format="<green>{time:%Y-%m-%d %H:%M:%S}</green> {message}", level="INFO")
+    # via tqdm.write, not sys.stdout: it clears any live progress bar before writing and
+    # redraws it after, so log lines never land on top of a bar. end="" because loguru
+    # hands the sink an already-terminated message.
+    logger.add(lambda m: tqdm.write(m, end=""), colorize=True,
+               format="<green>{time:%Y-%m-%d %H:%M:%S}</green> {message}", level="INFO")
     logger.add(f"{logpath}/{time.strftime('%Y-%m-%d_%H-%M-%S')}.log")
 
     # Update eventlab config and run data check
