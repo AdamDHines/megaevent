@@ -1,6 +1,7 @@
 import argparse, os, time, sys
 
 from loguru import logger
+from src.inference import run
 from src.eventlab import update_cfg
 
 def eventlab(args):
@@ -10,6 +11,10 @@ def eventlab(args):
         update_cfg(args)
     else:
         logger.info(f"Data exists at {args.eventlab_dir}/{args.dataset}")
+
+def inference(args):
+    logger.info(f"Running inference on {args.dataset}: DB {args.ref} <--> Q {args.query} @ {args.dt_ms} ms.")
+    run(args)
 
 def main():
 
@@ -31,6 +36,13 @@ def main():
     # Event-LAB args
     parser.add_argument("--eventlab-dir", type=str, default="./data",
                         help="Sets the Event-LAB default dataset directory.")
+    # Event stream parameters
+    parser.add_argument("--no-hot-pixel", action="store_true",
+                        help="If set, disables hot pixel removal.")
+    parser.add_argument("--no-event-filter", action="store_true",
+                        help="If set, disables background activity event filtering.")
+    parser.add_argument("--event-filter-dt-ms", type=int, default=None,
+                        help="Sets the time window in milliseconds for event filtering, default is the set dt-ms.")
 
     args = parser.parse_args()
 
@@ -44,6 +56,9 @@ def main():
 
     # Update eventlab config and run data check
     eventlab(args)
+
+    # Run the evaluation network
+    inference(args)
 
 if __name__ == "__main__":
     main()
