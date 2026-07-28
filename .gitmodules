@@ -7,3 +7,6 @@
 [submodule "external/vprtutorial"]
 	path = external/vprtutorial
 	url = https://github.com/stschubert/VPR_Tutorial.git
+[submodule "external/dinov2"]
+	path = external/dinov2
+	url = https://github.com/facebookresearch/dinov2.git
