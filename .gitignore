@@ -223,3 +223,5 @@ __marimo__/
 # project files
 *.pt
 features/
+# Event-GeM is vendored as a plain clone until it is promoted to a submodule
+external/eventgem/

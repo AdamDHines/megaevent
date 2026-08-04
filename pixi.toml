@@ -31,6 +31,8 @@ mkl = ">=2026.1.0,<2027"
 wandb = ">=0.28.0,<0.29"
 scikit-image = ">=0.26.0,<0.27"
 matplotlib = ">=3.11.0,<4"
+# cv2.findHomography(USAC_FAST) — Event-GeM's keypoint re-ranker
+opencv = ">=4.12,<6"
 loguru = ">=0.7.3,<0.8"
 pynmea2 = ">=1.19.0,<2"
 cuda-version = "12.*"

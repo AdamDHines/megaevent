@@ -150,7 +150,7 @@ class EventStreamDataset(Dataset):
     """
 
     def __init__(self, dataset, traverse, path, transform, representation, dt_ms, sensor,
-                 hot_pixel=True, filter_dt_us=None, no_event_filter=True, event_filter_dt_ms=None):
+                 hot_pixel=True, filter_dt_us=None):
         self.dataset = dataset
         self.traverse = traverse
         self.path = path
@@ -159,9 +159,12 @@ class EventStreamDataset(Dataset):
         self.dt_ms = dt_ms
         self.sensor = tuple(sensor)
         self.hot_pixel = bool(hot_pixel)
+        # ``filter_dt_us`` is the *only* switch for the background-activity filter: None
+        # disables it, a value enables it. It used to share that job with a separate
+        # ``no_event_filter`` gate that no caller ever passed, so the filter never ran —
+        # a bank tagged `_ba50` was byte-identical to its `_baoff` twin. One parameter
+        # cannot disagree with itself.
         self.filter_dt_us = int(filter_dt_us) if filter_dt_us else None
-        self.no_event_filter = bool(no_event_filter)
-        self.event_filter_dt_ms = int(event_filter_dt_ms) if event_filter_dt_ms else None
         self._reader = None
 
         # Open once up front to learn the length and to fail loudly *here* rather than
@@ -190,12 +193,12 @@ class EventStreamDataset(Dataset):
             reader = ecv.open(self.path, dt_ms=self.dt_ms, sensor_size=self.sensor,
                                   hot_pixel_filter=self.hot_pixel, offset=offset)
 
-            # Run filtering on the event stream
-            if not self.no_event_filter:
-                if self.event_filter_dt_ms is not None:
-                    reader = reader.background_activity_filter(self.event_filter_dt_ms)
-                else:
-                    reader = reader.background_activity_filter(self.dt_ms)
+            # Background-activity (nearest-neighbour) denoising. eventcv's `dt` is in the
+            # stream's *raw timestamp units* — microseconds here, not milliseconds. Passing
+            # `dt_ms` (50) asked for a 50 us correlation window and threw away ~94% of the
+            # active pixels; 50_000 us is the 50 ms window that was meant, and retains ~84%.
+            if self.filter_dt_us is not None:
+                reader = reader.background_activity_filter(self.filter_dt_us)
 
             return reader.with_repr(self.representation,
                                     **_repr_kwargs(self.representation, self.dt_ms))
@@ -442,8 +445,15 @@ def _block_reduce(a, out_hw, how):
     return b.min(axis=(1, 3)) if how == "min" else b.max(axis=(1, 3))
 
 
-def make_figure(sim, gt, top1, tp, rec, ref, query, subtitle, out_png, gt_shape):
-    """Reference on the y axis, query on the x axis — the ``[ref, query]`` orientation."""
+def make_figure(sim, gt, top1, tp, rec, ref, query, subtitle, out_png, gt_shape,
+                metric_label="cosine similarity"):
+    """Reference on the y axis, query on the x axis — the ``[ref, query]`` orientation.
+
+    ``metric_label`` names what the colour ramp shows. It is only ever a plain cosine for
+    this module's own model, but :mod:`src.traversevpr` reuses the figure for spaces that
+    are whitened and sometimes re-ranked, and a colourbar that misnames its quantity is
+    worse than no colourbar.
+    """
     nr, nq = sim.shape
     s_small = _block_reduce(sim, (1250, 1400), "max")             # max: keep the dark band
     g_small = _block_reduce(gt.astype(np.uint8), (1250, 1400), "max").astype(bool)
@@ -458,7 +468,7 @@ def make_figure(sim, gt, top1, tp, rec, ref, query, subtitle, out_png, gt_shape)
     ax.contour(np.linspace(0, nq, g_small.shape[1]), np.linspace(0, nr, g_small.shape[0]),
                g_small.astype(float), levels=[0.5], colors=[C_FP], linewidths=0.7)
     cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
-    cb.set_label("cosine similarity  (dark = better match)", color=C_MUTED, fontsize=9)
+    cb.set_label(f"{metric_label}  (dark = better match)", color=C_MUTED, fontsize=9)
     cb.ax.tick_params(colors=C_MUTED, labelsize=8)
     ax.set_title("(a) similarity matrix + ground-truth band", fontsize=10, color=C_TEXT, loc="left")
     ax.set_xlabel(f"{query} query frame", color=C_MUTED, fontsize=9)
