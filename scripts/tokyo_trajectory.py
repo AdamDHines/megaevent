@@ -86,10 +86,24 @@ def identical(a, b):
     return all(torch.equal(a[k], b[k].cpu()) for k in a)
 
 
+def norm_spec(values, places=9):
+    """Normalisation constants rounded to a tolerance, for the shared-transform check.
+
+    Two runs of the same training wave can record the same constant to a different last bit
+    — ``0.2065639348198454`` against ``0.20656393481984536``, 2.8e-17 apart — because each
+    recomputed it from the same pixels in a different reduction order. That is not a
+    different normalisation, and rejecting it would split an architecture ablation into one
+    single-model pass per arm. A genuine mismatch (a different representation, a different
+    training tree) differs in the second decimal, so nine places separates the two cases with
+    room to spare.
+    """
+    return tuple(round(float(v), places) for v in values)
+
+
 def load_all(ckpts, device, resolution):
     """([(name, step, model)], shared transform), dropping weight-identical duplicates.
 
-    Every checkpoint of one run shares the normalisation constants and the input size, so
+    Checkpoints scored together must share the normalisation constants and the input size, so
     they share one transform — which is what lets a single pass over the frames feed all of
     them. A mismatch would mean the banks were not comparable, so it is an error, not a
     silent per-model re-render.
@@ -105,7 +119,7 @@ def load_all(ckpts, device, resolution):
             print(f"  {name:10s} step {step:>6}  identical weights to {dup} — skipping")
             del model
             continue
-        this = (cfg.H, cfg.W, tuple(cfg.tencode_mean), tuple(cfg.tencode_std))
+        this = (cfg.H, cfg.W, norm_spec(cfg.tencode_mean), norm_spec(cfg.tencode_std))
         if spec is None:
             spec, transform = this, inf.eval_transform(cfg)
         elif this != spec:
@@ -163,7 +177,20 @@ def extract(loaded, transform, paths, out_dir, tag, device, batch_size, workers)
     return files
 
 
-def score_bank(db_path, q_path, gt, device):
+def parse_pca(specs, default=PCA_SETTINGS):
+    """``["4096,0.5", ...]`` -> ``[(4096, 0.5), ...]``; ``None`` keeps ``default``."""
+    if not specs:
+        return list(default)
+    out = []
+    for spec in specs:
+        dim, _, power = spec.partition(",")
+        if not power:
+            raise SystemExit(f"--pca wants DIM,POWER (e.g. 4096,0.5), got {spec!r}")
+        out.append((int(dim), float(power)))
+    return out
+
+
+def score_bank(db_path, q_path, gt, device, pca_settings=PCA_SETTINGS):
     """{'native': {...}, '(dim, power)': {...}} for one checkpoint's banks."""
     db = torch.from_numpy(np.load(db_path, mmap_mode="r").copy())
     queries = torch.from_numpy(np.load(q_path, mmap_mode="r").copy())
@@ -173,7 +200,7 @@ def score_bank(db_path, q_path, gt, device):
     if db.size(0) > scoring.PCA_FIT_SAMPLES:
         generator = torch.Generator().manual_seed(scoring.PCA_FIT_SEED)
         fit = db[torch.randperm(db.size(0), generator=generator)[:scoring.PCA_FIT_SAMPLES]]
-    for dim, power in PCA_SETTINGS:
+    for dim, power in pca_settings:
         pca = inf.pca_fit(fit, device, dim=dim, power=power)
         out[f"pca{dim}p{power}"] = inf.recall_at_k(
             inf.sim_matrix(inf.pca_apply(db, pca, device),
@@ -191,6 +218,13 @@ def main():
     ap.add_argument("--resolution", type=int, default=0,
                     help="override the checkpoint's H=W (multiple of 14); 0 keeps 224")
     ap.add_argument("--only", nargs="*", help="checkpoint stems to score (default: all)")
+    ap.add_argument("--pca", nargs="+", metavar="DIM,POWER", default=None,
+                    help="whitening settings to report beside the native descriptor "
+                         f"(default: {' '.join(f'{d},{p}' for d, p in PCA_SETTINGS)}). "
+                         "power 0.5 is the SALAD optimum and 0.25 the GeM one, so a table "
+                         "mixing aggregators wants both — otherwise one arm is scored with "
+                         "the other's hyperparameter. Each extra setting is one more fit "
+                         "and re-score of banks already on disk.")
     ap.add_argument("--limit", type=int, default=0,
                     help="keep only the N database images nearest a query (0 = full bank)")
     ap.add_argument("--threshold-m", type=float, default=25.0)
@@ -198,6 +232,7 @@ def main():
     ap.add_argument("--workers", type=int, default=inf.NUM_WORKERS)
     args = ap.parse_args()
 
+    pca_settings = parse_pca(args.pca)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tag = f"r{args.resolution or 224}" + (f"_limit{args.limit}" if args.limit else "")
     os.makedirs(args.out_dir, exist_ok=True)
@@ -233,7 +268,8 @@ def main():
     results = {}
     for name in db_files:
         results[name] = {"step": steps[name],
-                         **score_bank(db_files[name], q_files[name], gt, device)}
+                         **score_bank(db_files[name], q_files[name], gt, device,
+                                      pca_settings=pca_settings)}
         row = results[name]
         print(f"  {name:10s} step {steps[name]:>6}  " + "   ".join(
             f"{key} R@1 {val[1]:.4f}" for key, val in row.items() if key != "step"), flush=True)
@@ -242,15 +278,16 @@ def main():
     with open(out_json, "w") as handle:
         json.dump({"resolution": args.resolution or 224, "limit": args.limit,
                    "n_database": len(db_paths), "n_queries": len(q_paths),
-                   "threshold_m": args.threshold_m, "results": results}, handle, indent=2)
+                   "threshold_m": args.threshold_m,
+                   "pca": [list(s) for s in pca_settings], "results": results}, handle, indent=2)
 
-    print(f"\n{'checkpoint':<11}{'step':>7}" + "".join(
-        f"{k:>28}" for k in ("native", *(f"pca{d}p{p}" for d, p in PCA_SETTINGS))))
-    print(f"{'':<11}{'':>7}" + "".join(f"{'R@1    R@5   R@10   R@20':>28}"
-                                       for _ in range(1 + len(PCA_SETTINGS))))
+    columns = ("native", *(f"pca{d}p{p}" for d, p in pca_settings))
+    print(f"\n{'checkpoint':<14}{'step':>7}" + "".join(f"{k:>28}" for k in columns))
+    print(f"{'':<14}{'':>7}" + "".join(f"{'R@1    R@5   R@10   R@20':>28}"
+                                       for _ in columns))
     for name, row in sorted(results.items(), key=lambda kv: order_key(kv[0])):
-        line = f"{name:<11}{row['step']:>7}"
-        for key in ("native", *(f"pca{d}p{p}" for d, p in PCA_SETTINGS)):
+        line = f"{name:<14}{row['step']:>7}"
+        for key in columns:
             line += "  " + " ".join(f"{row[key][k]:.4f}" for k in KS)
         print(line)
     print(f"\n-> {out_json}")

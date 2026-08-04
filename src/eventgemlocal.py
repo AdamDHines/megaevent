@@ -197,7 +197,8 @@ def sample_descriptors_at_kpts(keypoints, descriptors, Hc, Wc):
     return F.normalize(sampled[0, :, 0, :].t(), p=2, dim=1)
 
 
-def extract_keypoints(model, config, fast_nms, paths, device, size, out_path, label=""):
+def extract_keypoints(model, config, fast_nms, paths, device, size, out_path, label="",
+                      dataset=None):
     """Run SuperEvent over ``paths`` and stream the keypoints into one ``.pt`` store.
 
     The store is upstream's own format (``eventgem/utils/kp_store.py``), so
@@ -205,6 +206,11 @@ def extract_keypoints(model, config, fast_nms, paths, device, size, out_path, la
     ``(N, K, 2)`` keypoints as ``(x, y)`` in uncropped image coordinates, and a per-frame valid
     count. It is memory-mapped while being filled, so resident memory is one batch however long
     the shortlist is.
+
+    ``dataset`` overrides the default ``.npz``-per-path source with any indexable source of
+    ``[10, H, W]`` MCTS frames, for callers that stream a traverse out of its HDF5 rather than
+    materialising it (``scripts/eventgem_pooled.py``). ``paths`` is then only the manifest key,
+    and the two must stay the same length and order.
     """
     from eventgem.utils.kp_store import KeypointStoreWriter
 
@@ -217,7 +223,11 @@ def extract_keypoints(model, config, fast_nms, paths, device, size, out_path, la
     top_k = max(hc, wc) // 2
     desc_dim = int(config["descriptor_size"])
 
-    ds = NpzFrameDataset(paths, lambda p: torch.from_numpy(load_mcts(p, size=size)))
+    ds = dataset if dataset is not None else NpzFrameDataset(
+        paths, lambda p: torch.from_numpy(load_mcts(p, size=size)))
+    if len(ds) != len(paths):
+        raise ValueError(f"keypoint source has {len(ds)} frames but the manifest has "
+                         f"{len(paths)} — the store would be indexed against the wrong rows")
     writer = KeypointStoreWriter(out_path=out_path, n_frames=len(paths), k_max=top_k,
                                  desc_dim=desc_dim, image_shape=(height, width))
     try:
@@ -289,12 +299,14 @@ class LocalReranker:
         self.match_filter, self.match_ratio = match_filter, float(match_ratio)
         self._query_store = None
 
-    def _store(self, paths, kind):
+    def _store(self, paths, kind, dataset=None):
         """Path to a keypoint store for ``paths``, extracting it if the cache is cold.
 
         The manifest is the list of basenames the store was built from, checked by
         :func:`src.imagevpr._check_manifest` — the same guard the descriptor caches use, and
         the reason a shortlist that changed underneath a store cannot silently mis-index it.
+        ``dataset`` streams the frames instead of reading them per path; ``paths`` remains the
+        manifest key, so the guard works identically either way.
         """
         os.makedirs(self.cache_dir, exist_ok=True)
         store = os.path.join(self.cache_dir, f"{self.tag}_{kind}_kps.pt")
@@ -305,10 +317,94 @@ class LocalReranker:
         logger.info(f"{kind}: extracting keypoints for {len(paths)} frames "
                     f"({keypoint_budget(*self.size, input_multiple(self.config))} per frame)...")
         extract_keypoints(self.model, self.config, self.fast_nms, paths, self.device,
-                          self.size, store, label=f"{kind} keypoints")
+                          self.size, store, label=f"{kind} keypoints", dataset=dataset)
         with open(manifest, "w") as f:
             f.write("\n".join(os.path.basename(p) for p in paths))
         return store
+
+    def rerank_shortlists(self, shortlists, sims, db_keys, q_keys, label="",
+                          db_dataset=None, q_dataset=None):
+        """Re-score ``[k, n_q]`` shortlists in place of a full ``[n_db, n_q]`` matrix.
+
+        :meth:`rerank` takes the whole similarity matrix, which a pooled traverse cannot afford
+        to build — NSAVP's is 100,958 x 20,954, or 8.5 GB. It does not need it: re-ranking only
+        ever *subtracts* ``inlier_weight`` per inlier from a shortlisted candidate's distance,
+        so nothing outside the shortlist can move and nothing inside it can fall below a
+        candidate that was already behind it before the shortlist. Re-ordering within the
+        top-``k`` is therefore exactly what re-ordering the full column would produce, for every
+        cutoff up to ``k``.
+
+        ``shortlists`` is ``[k, n_q]`` database row indices, nearest first, and ``sims`` their
+        cosine similarities. Returns the same array re-ordered by the re-ranked distance.
+        ``db_keys``/``q_keys`` are manifest identifiers (a path, or any stable per-frame string);
+        ``db_dataset``/``q_dataset`` stream the frames.
+        """
+        from eventgem.utils.rerank_utils import open_keypoint_bank
+
+        k, n_q = shortlists.shape
+        n_db = len(db_keys)
+        dist = 1.0 - np.asarray(sims, dtype=np.float32)          # [k, n_q], upstream's units
+        union = np.unique(shortlists)
+        # Same threshold as :meth:`rerank`. On a traverse the shortlists cover nearly the whole
+        # gallery, and the store is keyed on ``label``, so each descriptor space would extract
+        # and keep its own near-identical copy — 20 GB apiece on NSAVP. Widening the extracted
+        # set can only add rows no shortlist reads, so the re-ranking is unchanged and the
+        # spaces share one store.
+        if len(union) >= 0.9 * n_db:
+            union, store_tag = np.arange(n_db), "db"
+        else:
+            store_tag = f"{label}_db" if label else "db"
+        row_of = np.full(n_db, -1, dtype=np.int64)
+        row_of[union] = np.arange(len(union))
+        logger.info(f"[{label} rerank] top-{k} shortlists cover {len(np.unique(shortlists))} of "
+                    f"{n_db} database frames"
+                    + ("" if store_tag != "db" else " — sharing one full-database store"))
+
+        db_bank = open_keypoint_bank(self._store(
+            [db_keys[i] for i in union], store_tag,
+            dataset=None if db_dataset is None else db_dataset.select(union)))
+        if self._query_store is None:
+            self._query_store = self._store(q_keys, "queries", dataset=q_dataset)
+        q_bank = open_keypoint_bank(self._query_store)
+
+        out = np.array(shortlists, copy=True)
+        cv2.setNumThreads(1)
+        with threadpool_limits(limits=1):
+            results = Parallel(n_jobs=NUM_WORKERS, backend="threading",
+                               return_as="generator_unordered")(
+                delayed(self._rerank_column)(q, shortlists[:, q], row_of, dist[:, q],
+                                             db_bank, q_bank)
+                for q in tqdm(range(n_q), desc=f"{label} rerank", unit="query", disable=None,
+                              leave=False))
+            verified = 0
+            for q, column, matched in results:
+                out[:, q] = column
+                verified += matched
+        logger.info(f"[{label} rerank] {verified} of {k * n_q} candidate pairs found a "
+                    f"homography ({100 * verified / (k * n_q):.1f}%)")
+        return out
+
+    def _rerank_column(self, q, shortlist, row_of, base, db_bank, q_bank):
+        """One query's shortlist, re-scored and re-ordered. Worker for the loop above.
+
+        ``compute_inliers_2d`` is upstream's, called unmodified; the stable sort keeps the
+        global stage's order among candidates that verification cannot separate.
+        """
+        from eventgem.utils.rerank_utils import bank_lookup, compute_inliers_2d
+
+        q_data = bank_lookup(q_bank, q)
+        if q_data is None:                      # fewer than 4 keypoints: nothing to verify
+            return q, shortlist, 0
+        matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        scores, matched = base.copy(), 0
+        for i, db_idx in enumerate(shortlist):
+            inliers = compute_inliers_2d(
+                q_data, bank_lookup(db_bank, int(row_of[db_idx])), matcher, self.ransac_thresh,
+                match_filter=self.match_filter, match_ratio=self.match_ratio)
+            if inliers > 0:
+                scores[i] = base[i] - inliers * self.inlier_weight
+                matched += 1
+        return q, shortlist[np.argsort(scores, kind="stable")], matched
 
     def rerank(self, sim, db_paths, q_paths, label=""):
         """``[n_db, n_q]`` similarities -> the same matrix with every shortlist re-scored.

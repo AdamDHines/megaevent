@@ -85,11 +85,17 @@ recallAtK = _load_recall_at_k()
 # 1. Event-LAB dataset layout
 # ---------------------------------------------------------------------------
 def sequence_path(args, seq):
-    """The raw recording for one traverse: ``<eventlab-dir>/<dataset>/<seq>/<seq>.hdf5``."""
-    path = os.path.join(args.eventlab_dir, args.dataset, seq, f"{seq}.hdf5")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"no recording for '{seq}' at {path}")
-    return path
+    """The raw recording for one traverse: ``<eventlab-dir>/<dataset>/<seq>/<seq>.{hdf5,h5}``.
+
+    Both extensions are accepted because NSAVP ships with both — five of its nine traverses
+    are ``.h5`` and four ``.hdf5``, from the same release. Hardcoding one silently loses
+    whichever half does not match, and the failure looks like a missing download.
+    """
+    base = os.path.join(args.eventlab_dir, args.dataset, seq, seq)
+    for ext in (".hdf5", ".h5"):
+        if os.path.exists(base + ext):
+            return base + ext
+    raise FileNotFoundError(f"no recording for '{seq}' at {base}.hdf5 or {base}.h5")
 
 
 def ground_truth_path(args):

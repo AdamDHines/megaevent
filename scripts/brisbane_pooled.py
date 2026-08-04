@@ -48,7 +48,7 @@ from src import scoring  # noqa: E402
 from src import traversegps as tg  # noqa: E402
 from src.imagevpr import build_gt, figure_error_map  # noqa: E402
 from brisbane_resolution import _Args, extract  # noqa: E402
-from tokyo_trajectory import load_all  # noqa: E402
+from tokyo_trajectory import load_all, parse_pca  # noqa: E402
 
 DEFAULT_EVENTLAB = "/media/adam/vprdatasets/eventgem"
 DEFAULT_NPZ_ROOT = "/media/adam/vprdatasets/megaevent/brisbane_npz"
@@ -69,25 +69,49 @@ STATIONARY_MS = 0.5                             # m/s below which a frame counts
 # ---------------------------------------------------------------------------
 # Scoring: streamed, never materialising [n_db, n_q]
 # ---------------------------------------------------------------------------
-def topk_ranked(db, q, device, k=max(KS), chunk=256):
+def topk_ranked(db, q, device, k=max(KS), chunk=256, db_chunk=None, return_scores=False):
     """``[k, n_q]`` int32 database row indices, best first.
 
-    The database bank is resident on the GPU and the queries stream past it, so the peak
-    allocation is one ``[n_db, chunk]`` similarity block rather than the whole matrix. Both
-    banks are L2-normalised (the model's head normalises, and so does :func:`pca_apply`), so
-    a dot product is cosine similarity.
+    The queries stream past a resident database, so the peak allocation is one
+    ``[n_db, chunk]`` similarity block rather than the whole matrix. Both banks are
+    L2-normalised (the model's head normalises, and so does :func:`pca_apply`), so a dot
+    product is cosine similarity.
+
+    ``db_chunk`` splits the *database* as well, merging each chunk's top-k into a running
+    best. That is exactly equal to the single-pass result — top-k of the concatenated
+    per-chunk top-k is the global top-k — but it caps resident VRAM at one chunk instead of
+    the whole gallery. Brisbane's pooled bank is 54,620 x 8448 (1.8 GB) and fits whole;
+    NSAVP's is 101k x 8448 (3.4 GB) and does not, on an 8 GB card. Default None keeps the
+    gallery in one piece, so nothing changes for a bank that already fitted.
     """
-    db_gpu = db.to(device, non_blocking=True)
-    out = np.empty((k, q.size(0)), dtype=np.int32)
+    n_db, n_q = db.size(0), q.size(0)
+    step = n_db if db_chunk is None else int(db_chunk)
     with torch.no_grad():
-        for s in range(0, q.size(0), chunk):
-            block = q[s:s + chunk].to(device, non_blocking=True)
-            sim = db_gpu @ block.T                          # [n_db, chunk]
-            out[:, s:s + block.size(0)] = torch.topk(sim, k, dim=0).indices.cpu().numpy()
-            del sim, block
-    del db_gpu
+        # The running best is [k, n_q] — 20 x 14k is ~1 MB, so it stays on the GPU while
+        # the gallery streams past it. Database chunks are the outer loop so each one is
+        # transferred exactly once; queries re-stream per chunk, which is the far cheaper
+        # of the two directions.
+        best_v = torch.full((k, n_q), float("-inf"), device=device)
+        best_i = torch.zeros((k, n_q), dtype=torch.long, device=device)
+        for d in range(0, n_db, step):
+            part = db[d:d + step].to(device, non_blocking=True)
+            for s in range(0, n_q, chunk):
+                block = q[s:s + chunk].to(device, non_blocking=True)
+                sim = part @ block.T                        # [chunk_db, chunk_q]
+                v, i = torch.topk(sim, min(k, sim.size(0)), dim=0)
+                cols = slice(s, s + block.size(0))
+                cv = torch.cat([best_v[:, cols], v], 0)
+                cidx = torch.cat([best_i[:, cols], i + d], 0)   # d: back to global rows
+                best_v[:, cols], sel = torch.topk(cv, k, dim=0)
+                best_i[:, cols] = torch.gather(cidx, 0, sel)
+                del sim, v, i, cv, cidx, block
+            del part
+            torch.cuda.empty_cache()
+        out = best_i.cpu().numpy().astype(np.int32)
+        scores = best_v.cpu().numpy().astype(np.float32) if return_scores else None
+        del best_v, best_i
     torch.cuda.empty_cache()
-    return out
+    return (out, scores) if return_scores else out
 
 
 def recall_from_ranked(ranked, gt, ks=KS):
@@ -223,7 +247,7 @@ def score_configuration(bank_files, geom, args, cli, label, device, tag):
 
     curves, first = {}, None
     spaces = [("native", db_desc, q_desc)]
-    for dim, power in PCA_SETTINGS:
+    for dim, power in cli.pca:
         fit = db_desc
         if fit.size(0) > scoring.PCA_FIT_SAMPLES:
             gen = torch.Generator().manual_seed(scoring.PCA_FIT_SEED)
@@ -251,22 +275,30 @@ def score_configuration(bank_files, geom, args, cli, label, device, tag):
     # worth looking at here, because Brisbane's 1 Hz GPS puts consecutive fixes a median
     # 13.9 m apart, so a 25 m radius sits close to the ground truth's own noise floor.
     rankings = {}
+    # ``rank_fn`` lets a method contribute more than one ranking per descriptor space — Event-GeM
+    # returns its global ranking *and* the homography-verified one, so both are scored side by
+    # side from a single pass. Default: the plain top-k this script has always used.
+    rank_fn = getattr(cli, "rank_fn", None)
     for name, db_space, q_space in spaces:
-        rankings[name] = topk_ranked(db_space, q_space, device, chunk=cli.score_chunk)
-        # How far the top-1 actually lands, in metres — a GT-free read on retrieval quality.
-        d = np.linalg.norm(db_xy[rankings[name][0]] - q_xy, axis=1)
-        out["top1_distance_m"][name] = {
-            "median": float(np.median(d)), "p25": float(np.percentile(d, 25)),
-            "p75": float(np.percentile(d, 75)), "p90": float(np.percentile(d, 90))}
-        # Which traverse actually served the top-1. A pooled gallery can be carried by one
-        # easy condition — here sunset1's query shares its lighting with sunset2 — and a
-        # single R@1 cannot show that. Compared against each traverse's share of the
-        # gallery, so an over-represented traverse is not mistaken for a preferred one.
-        won = np.bincount(source[rankings[name][0]], minlength=len(cli.database))
-        out["top1_source"][name] = {
-            s: {"share_of_top1": float(won[i] / won.sum()),
-                "share_of_database": float((source == i).sum() / len(source))}
-            for i, s in enumerate(cli.database)}
+        produced = (rank_fn(name, db_space, q_space, device) if rank_fn else
+                    {name: topk_ranked(db_space, q_space, device, chunk=cli.score_chunk,
+                                       db_chunk=getattr(cli, "db_chunk", None))})
+        for rname, ranked in produced.items():
+            rankings[rname] = ranked
+            # How far the top-1 actually lands, in metres — a GT-free read on retrieval quality.
+            d = np.linalg.norm(db_xy[ranked[0]] - q_xy, axis=1)
+            out["top1_distance_m"][rname] = {
+                "median": float(np.median(d)), "p25": float(np.percentile(d, 25)),
+                "p75": float(np.percentile(d, 75)), "p90": float(np.percentile(d, 90))}
+            # Which traverse actually served the top-1. A pooled gallery can be carried by one
+            # easy condition — here sunset1's query shares its lighting with sunset2 — and a
+            # single R@1 cannot show that. Compared against each traverse's share of the
+            # gallery, so an over-represented traverse is not mistaken for a preferred one.
+            won = np.bincount(source[ranked[0]], minlength=len(cli.database))
+            out["top1_source"][rname] = {
+                s: {"share_of_top1": float(won[i] / won.sum()),
+                    "share_of_database": float((source == i).sum() / len(source))}
+                for i, s in enumerate(cli.database)}
         if name != "native":
             del db_space, q_space
 
@@ -322,6 +354,12 @@ def main():
     ap.add_argument("--query", default=QUERY)
     ap.add_argument("--database", nargs="+", default=list(DATABASE))
     ap.add_argument("--resolutions", type=int, nargs="+", default=[322, 224])
+    ap.add_argument("--pca", nargs="+", metavar="DIM,POWER", default=None,
+                    help="whitening settings to report beside the native descriptor "
+                         f"(default: {' '.join(f'{d},{p}' for d, p in PCA_SETTINGS)}). "
+                         "power 0.5 is the SALAD optimum and 0.25 the GeM one, so a table "
+                         "mixing aggregators wants both — otherwise one arm is scored with "
+                         "the other's hyperparameter.")
     ap.add_argument("--arms", nargs="+", default=["on", "off"], choices=["on", "off"],
                     help="background-activity filter arms to run")
     ap.add_argument("--threshold-m", type=float, default=25.0,
@@ -350,6 +388,7 @@ def main():
 
     if cli.threshold_m not in cli.thresholds_m:
         cli.thresholds_m = sorted([cli.threshold_m, *cli.thresholds_m])
+    cli.pca = parse_pca(cli.pca, PCA_SETTINGS)
     pairs = [tuple(spec.split("=", 1)) for spec in cli.ckpt]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(cli.out_dir, exist_ok=True)
@@ -412,6 +451,7 @@ def main():
                                "checkpoints": {a: b for a, b in pairs},
                                "query": cli.query, "database": list(cli.database),
                                "threshold_m": cli.threshold_m, "dt_ms": cli.dt_ms,
+                               "pca": [list(s) for s in cli.pca],
                                "hot_pixel": not cli.no_hot_pixel, "results": all_results},
                               handle, indent=2)
                 os.replace(tmp, out_json)           # a reader never sees a half-written file
