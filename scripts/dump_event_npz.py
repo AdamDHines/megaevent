@@ -139,6 +139,13 @@ def main():
                     help="disable hot-pixel removal (the traverse evaluation leaves it on)")
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--no-resume", action="store_true")
+    ap.add_argument("--times-only", action="store_true",
+                    help="write slice_times.npy and dump.json, then stop. The pooled "
+                         "protocol reads events straight from the HDF5, so it needs the "
+                         "grid — for scripts/extract_aps.py to align APS frames to, and "
+                         "for src.traversegps.check_slice_times to assert metadata.json "
+                         "against — but not the ~14k .npz files per traverse that carrying "
+                         "it would otherwise cost.")
     args = ap.parse_args()
 
     path = os.path.join(args.eventlab_dir, args.dataset, args.seq, f"{args.seq}.hdf5")
@@ -170,6 +177,31 @@ def main():
     starts = origin_us + np.arange(n, dtype=np.float64) * dt_us
     slice_times = np.stack([starts, starts + dt_us], axis=1)
     np.save(os.path.join(out_dir, "slice_times.npy"), slice_times)
+
+    if args.times_only:
+        # Never downgrade a real dump's provenance to a stub. sunset1/sunset2 were fully
+        # materialised in July and their dump.json records event counts this path cannot know.
+        existing = os.path.join(out_dir, "dump.json")
+        if os.path.exists(existing):
+            with open(existing) as f:
+                prior = json.load(f)
+            if not prior.get("times_only"):
+                print(f"  times-only: {existing} is from a full dump ({prior['n_slices']} "
+                      f"slices, {prior['events']} events) — left untouched")
+                return 0
+        # Same schema as the full report so downstream readers need no special case; the
+        # event tallies are the one thing that cannot be known without reading the slices.
+        report = {"sequence": args.seq, "dataset": args.dataset, "source": path,
+                  "dt_ms": args.dt_ms, "yaml_offset_s": offset / 1000.0,
+                  "framing_origin_s": origin_us / 1e6, "offset_clamped": bool(clamped),
+                  "sensor_wh": list(sensor), "hot_pixel_filter": cfg["hot_pixel"],
+                  "background_activity_filter": False, "n_slices": n,
+                  "times_only": True, "events": None, "empty_slices": None,
+                  "bytes": 0, "seconds": 0.0}
+        with open(os.path.join(out_dir, "dump.json"), "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"  times-only: wrote the {n}-slice grid, no .npz")
+        return 0
 
     # Contiguous ranges, not a round-robin: eventcv reads the stream in order, so a worker
     # that walks a block sequentially stays on one part of the file.

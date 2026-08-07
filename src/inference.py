@@ -425,7 +425,10 @@ def recall_at_k(sim, gt, ks=KS):
     Note its denominator: queries with no ground-truth reference at all are **discarded**,
     so this is recall over scorable queries, not over every query.
     """
-    return {k: float(recallAtK(sim, gt, K=k)) for k in ks}
+    # Small ``--limit`` smoke tests may contain fewer references than the reporting
+    # cutoffs. In that case R@K is naturally R@all available references; the upstream
+    # helper otherwise over-indexes its top-K array.
+    return {k: float(recallAtK(sim, gt, K=min(k, sim.shape[0]))) for k in ks}
 
 
 # ---------------------------------------------------------------------------

@@ -173,6 +173,23 @@ def recall_curve(sim, gt, max_n=MAX_N):
     return {k: float(found[k - 1].mean()) for k in range(1, n + 1)}, ranked, scorable
 
 
+def map_at_k(ranked, gt, scorable, ks=KS):
+    """MSLS mean average precision at each cutoff, matching its official evaluator."""
+    query_indexes = np.flatnonzero(scorable)
+    out = {}
+    for k in ks:
+        cutoff = min(k, ranked.shape[0])
+        scores = []
+        for column, query in enumerate(query_indexes):
+            positives = gt[:, query]
+            hits = positives[ranked[:cutoff, column]].astype(np.float64)
+            precision = np.cumsum(hits) / np.arange(1, cutoff + 1)
+            denominator = min(int(positives.sum()), k)
+            scores.append(float((precision * hits).sum() / denominator))
+        out[k] = float(np.mean(scores))
+    return out
+
+
 def cross_check(curve, rec):
     """Warn if the fast curve and ``recallAtK`` disagree at a shared cutoff.
 
@@ -307,7 +324,8 @@ def evaluate(tag, sim, gt, device):
     return rec, curve, ranked, scorable, sim
 
 
-def score_both(method, db_desc, q_desc, gt, device, results, curves, label="", paths=None):
+def score_both(method, db_desc, q_desc, gt, device, results, curves, label="", paths=None,
+               map_ks=()):
     """Score one descriptor bank under the method's native metric *and* PCA whitening.
 
     Every method is reported both ways on purpose. Our own headline number uses
@@ -328,6 +346,10 @@ def score_both(method, db_desc, q_desc, gt, device, results, curves, label="", p
         rec, curve, ranked, mask, sim = evaluate(tag, sim, gt, device)
         results["recall"][tag] = {str(k): rec[k] for k in KS}
         results["recall_curve"][tag] = {str(n): v for n, v in curve.items()}
+        if map_ks:
+            ap = map_at_k(ranked, gt, mask, map_ks)
+            results.setdefault("map", {})[tag] = {str(k): ap[k] for k in map_ks}
+            logger.info(f"[{tag}] " + "  ".join(f"mAP@{k}={ap[k]:.3f}" for k in map_ks))
         curves[tag] = curve
         return rec, curve, ranked, mask, sim
 

@@ -51,6 +51,44 @@ import numpy as np
 SENSOR_H, SENSOR_W = 260, 346       # DAVIS346, the only geometry we accept
 TOPIC = "/dvs/image_raw"
 
+# Upstream ships the bags under their recording timestamps, and nothing in the traverse names
+# recovers which is which. Transcribed from ensemble-event-vpr's
+# ``correspondence_event_camera_frame_camera.py`` (``traverse_to_name``, minus its
+# ``run_tobi3_`` prefix), which is the authority for this dataset.
+BAG_NAMES = {
+    "sunset1": "dvs_vpr_2020-04-21-17-03-03",
+    "sunset2": "dvs_vpr_2020-04-22-17-24-21",
+    "daytime": "dvs_vpr_2020-04-24-15-12-03",
+    "night":   "dvs_vpr_2020-04-27-18-13-29",
+    "morning": "dvs_vpr_2020-04-28-09-14-11",
+    "sunrise": "dvs_vpr_2020-04-29-06-20-23",
+}
+
+
+def resolve_bag(seq, bag, bag_root):
+    """The bag for ``seq``. Explicit path wins, then ``<root>/<seq>/<seq>.bag``, then the
+    upstream recording name flat in ``<root>``.
+
+    Two layouts exist locally and both are legitimate: sunset1/sunset2 were renamed into
+    per-traverse directories long ago, while a fresh ``hf download`` lands every bag flat
+    under its upstream name. Trying the renamed form first keeps the older tree working.
+    """
+    if bag:
+        if not os.path.exists(bag):
+            raise FileNotFoundError(f"no bag at {bag}")
+        return bag
+    renamed = os.path.join(bag_root, seq, f"{seq}.bag")
+    if os.path.exists(renamed):
+        return renamed
+    if seq in BAG_NAMES:
+        upstream = os.path.join(bag_root, f"{BAG_NAMES[seq]}.bag")
+        if os.path.exists(upstream):
+            return upstream
+    raise FileNotFoundError(
+        f"no bag for {seq} under {bag_root}: tried {renamed}"
+        + (f" and {os.path.join(bag_root, BAG_NAMES[seq] + '.bag')}" if seq in BAG_NAMES
+           else f" (and {seq} is not a known traverse, so there is no upstream name to try)"))
+
 
 def slice_centres(slice_times_path):
     """Mid-bin time of every event slice, in unix seconds.
@@ -168,7 +206,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seq", required=True, help="traverse name, e.g. sunset1")
     ap.add_argument("--bag", default=None,
-                    help="default: <bag-root>/<seq>/<seq>.bag")
+                    help="default: <bag-root>/<seq>/<seq>.bag, else <bag-root>/"
+                         "<upstream recording name>.bag (see BAG_NAMES)")
     ap.add_argument("--bag-root", default="/media/adam/vprdatasets/eventlab/brisbane_event")
     ap.add_argument("--npz-root", default="/media/adam/vprdatasets/megaevent/brisbane_npz",
                     help="frames land in <npz-root>/brisbane_event/aps/<seq>")
@@ -181,9 +220,7 @@ def main():
                          "the offset up to the recording's first event).")
     args = ap.parse_args()
 
-    bag_path = args.bag or os.path.join(args.bag_root, args.seq, f"{args.seq}.bag")
-    if not os.path.exists(bag_path):
-        raise FileNotFoundError(f"no bag at {bag_path}")
+    bag_path = resolve_bag(args.seq, args.bag, args.bag_root)
 
     slice_times = args.slice_times or os.path.join(
         args.npz_root, args.dataset, "real", args.seq, "slice_times.npy")

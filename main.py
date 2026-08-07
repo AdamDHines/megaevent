@@ -8,11 +8,21 @@ from src.traversevpr import run as run_traverse_npz
 from src.eventlab import update_cfg
 
 # Datasets that are folders of independent images rather than continuous recordings. They
-# take a different path end to end: no Event-LAB download, no dt_ms slicing, and geographic
-# ground truth parsed from the filenames instead of a precomputed [ref, query] band.
-IMAGE_DATASETS = {"tokyo247"}
-# The two splits an image dataset is scored over, when --ref/--query are left unset.
-IMAGE_SPLITS = ("database", "queries")
+# take a different path end to end: no Event-LAB download or dt_ms slicing, and positives
+# come from per-image geography or the dataset's supplied ground truth.
+IMAGE_DATASETS = {"msls", "nycevent", "pitts", "pitts250k", "tokyo247"}
+# Dataset-native split names used when --ref/--query are left unset.
+IMAGE_SPLITS = {
+    "msls": ("database", "query"),
+    "nycevent": ("database", "queries"),
+    # `pitts` is same-panorama view retrieval off a supplied ground truth, NOT place
+    # recognition: its positives are the other 23 tiles of the query's own panorama.
+    # `pitts250k` is the official NetVLAD test split, where database and query tiles come
+    # from different Street View captures and positives are a 25 m GPS band.
+    "pitts": ("ref", "query"),
+    "pitts250k": ("database", "queries"),
+    "tokyo247": ("database", "queries"),
+}
 
 def eventlab(args):
     # Check if dataset exists, if not download it
@@ -39,18 +49,21 @@ def main():
     parser = argparse.ArgumentParser(description="Args for megaevent.")
 
     # Inference parameters
-    parser.add_argument("--dataset", "-d", type=str, required=True, choices=["brisbane_event", "nsavp", "nycevent", "pitts", "tokyo247"],
+    parser.add_argument("--dataset", "-d", type=str, required=True, choices=["brisbane_event", "msls", "nsavp", "nycevent", "pitts", "pitts250k", "tokyo247"],
                         help="Sets the dataset to be used for inference.")
     parser.add_argument("--ref", "-r", type=str, default=None,
                         help="Sets the reference dataset for inference. Image datasets "
-                             f"default to '{IMAGE_SPLITS[0]}'.")
+                             "use their standard database/reference split by default.")
     parser.add_argument("--query", "-q", type=str, default=None,
                         help="Sets the query dataset for inference. Image datasets "
-                             f"default to '{IMAGE_SPLITS[1]}'.")
+                             "use their standard query split by default.")
     parser.add_argument("--dt-ms", type=int, default=50,
                         help="Sets the time window in milliseconds for inference.")
     parser.add_argument("--model", "-m", type=str, default="s_salad_ft4", choices=["s_salad_ft4", "s_gem_ft4"],
                         help="Sets the model to be used for inference.")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Explicit MegaEvent checkpoint. Required for nycevent so a "
+                             "result never depends on a changing model-name default.")
     parser.add_argument("--feature-dir", type=str, default="./features",
                         help="Sets the directory to save features.")
     # Event-LAB args
@@ -85,10 +98,11 @@ def main():
                              "<root>/<dataset>/<source>/<traverse>/frame_%%06d.npz.")
     # Comparison baselines (image datasets, or a traverse with --source)
     parser.add_argument("--method", type=str, default="megaevent",
-                        choices=["megaevent", "sparse_event", "eventvlad", "eventgem"],
+                        choices=["megaevent", "sparse_event", "eventvlad", "eventgem",
+                                 "spikevpr"],
                         help="Which VPR method to evaluate. The baselines are ports of "
-                             "Event-LAB and Event-GeM, scored on identical data and ground "
-                             "truth.")
+                             "Event-LAB, Event-GeM and SpikeVPR, scored on identical data "
+                             "and ground truth.")
     parser.add_argument("--eventlab-repo", type=str, default="/home/adam/repo/Event-LAB",
                         help="Event-LAB checkout supplying EventVLAD's networks and weights.")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4],
@@ -113,8 +127,35 @@ def main():
     parser.add_argument("--match-filter", type=str, default="mutual",
                         choices=["mutual", "ratio"],
                         help="Keypoint correspondence filter before RANSAC.")
+    parser.add_argument("--no-extra-pca", action="store_true",
+                        help="Report only the shared PCA power, skipping a method's extra "
+                             "whitening exponents (Event-GeM's full-whitening pca1). Each one "
+                             "is a further re-rank pass and, on a large gallery, its own "
+                             "keypoint store.")
     parser.add_argument("--match-ratio", type=float, default=0.8,
                         help="Lowe ratio, used only by --match-filter ratio.")
+    # SpikeVPR args. Its forward pass runs in a separate pixi environment, because
+    # spikingjelly is not in this one and the vendored clone's PyTorch is CPU-only; see
+    # src/spikevpr_bridge.py.
+    parser.add_argument("--spikevpr-model", type=str, default=None,
+                        choices=["brisbane", "nsavp", "nyc"],
+                        help="Which released SpikeVPR checkpoint to evaluate. Required for "
+                             "--method spikevpr, and never defaulted: the three differ in "
+                             "what they were trained on, which is the whole point of "
+                             "running them cross-dataset.")
+    parser.add_argument("--spikevpr-repo", type=str, default="./SpikeVPR",
+                        help="SpikeVPR checkout supplying the model and its weights/.")
+    parser.add_argument("--spikevpr-env", type=str, default="./envs/spikevpr",
+                        help="pixi project the extractor runs in (CUDA torch + spikingjelly).")
+    parser.add_argument("--spikevpr-max-events", type=int, default=None,
+                        help="Render each frame from only the first N events of the window, "
+                             "the way SpikeVPR's own Brisbane pipeline frames a slice with "
+                             "ToFrame(event_count=15000). Off by default, so SpikeVPR sees "
+                             "the same events every other method sees. It is a diagnostic "
+                             "for Tokyo 24/7 above all, whose I2E saccades render a median "
+                             "7.2-8.4 events/px against the 0.167 these checkpoints were "
+                             "trained on — and the network normalises its input with "
+                             "nothing but a frozen BatchNorm.")
     # Event stream parameters
     parser.add_argument("--no-hot-pixel", action="store_true",
                         help="If set, disables hot pixel removal.")
@@ -127,13 +168,20 @@ def main():
 
     image_set = args.dataset in IMAGE_DATASETS
     if image_set:
-        args.ref = args.ref or IMAGE_SPLITS[0]
-        args.query = args.query or IMAGE_SPLITS[1]
+        default_ref, default_query = IMAGE_SPLITS[args.dataset]
+        args.ref = args.ref or default_ref
+        args.query = args.query or default_query
     elif not (args.ref and args.query):
         parser.error(f"--ref and --query are required for {args.dataset}")
     if image_set and args.source:
         parser.error(f"--source applies to traverse datasets; {args.dataset} is an image "
                      f"set, where each file is already one independent event stream")
+    if args.dataset == "nycevent" and args.method == "megaevent" and not args.ckpt:
+        parser.error("nycevent MegaEvent inference requires --ckpt PATH")
+    if args.method == "spikevpr" and not args.spikevpr_model:
+        parser.error("--method spikevpr requires --spikevpr-model {brisbane,nsavp,nyc}")
+    if args.spikevpr_model and args.method != "spikevpr":
+        parser.error(f"--spikevpr-model applies to --method spikevpr, not {args.method}")
     if not image_set and not args.source and args.method != "megaevent":
         # Without --source the traverse path reads the HDF5 stream directly and renders one
         # representation for one model, so it has no method abstraction to dispatch on. With

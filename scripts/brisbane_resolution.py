@@ -42,6 +42,7 @@ sys.path.insert(0, HERE)
 
 from src import inference as inf  # noqa: E402
 from src import scoring  # noqa: E402
+from src import traversenpz as tnpz  # noqa: E402
 from tokyo_trajectory import load_all  # noqa: E402  (identical fan-out / dedup logic)
 
 DEFAULT_EVENTLAB = "/media/adam/vprdatasets/eventgem"
@@ -64,9 +65,14 @@ DEFAULT_CKPTS = (
 class _Args:
     """The handful of attributes `src.inference`'s helpers read off an argparse namespace."""
 
-    def __init__(self, eventlab_dir, dataset, dt_ms, no_hot_pixel, no_event_filter):
+    def __init__(self, eventlab_dir, dataset, dt_ms, no_hot_pixel, no_event_filter,
+                 source="real", npz_root=None):
         self.eventlab_dir = eventlab_dir
         self.dataset = dataset
+        # Which arm the frames come from, and where the dumped arms live. Default `real`
+        # keeps every existing caller on the eventcv reader with no behaviour change.
+        self.source = source
+        self.npz_root = npz_root
         self.dt_ms = dt_ms
         self.no_hot_pixel = no_hot_pixel
         self.no_event_filter = no_event_filter
@@ -79,14 +85,34 @@ class _Args:
         self.query = None
 
 
+def _slice_source(traverse, transform, args):
+    """The traverse's frames, from the HDF5 recording or from a dumped ``.npz`` arm.
+
+    ``args.source`` defaults to ``real``, which is the eventcv reader this script has always
+    used and the only source the four traverses without an npz tree have. A Sim2Real arm has
+    no recording — its events were simulated by I2E from the APS frames — so it comes off
+    disk instead. Everything downstream (rendering, model, banks, scoring) is unchanged, so
+    the arms differ in exactly one thing.
+    """
+    source = getattr(args, "source", "real")
+    if source == "real":
+        return inf.EventStreamDataset(
+            args.dataset, traverse, inf.sequence_path(args, traverse), transform,
+            args.representation, args.dt_ms, inf.sensor_size(args.dataset),
+            hot_pixel=not args.no_hot_pixel,
+            filter_dt_us=args.filter_dt_us,
+        )
+    if args.representation != "countmask":
+        raise SystemExit(
+            f"the npz arms render via src.npzdata, which supplies countmask for this "
+            f"model — the checkpoint asks for '{args.representation}'")
+    paths = tnpz.frame_paths(args.npz_root, args.dataset, source, traverse)
+    return tnpz.NpzTraverseDataset(paths, tnpz.countmask_loader(transform))
+
+
 def extract(loaded, transform, traverse, args, out_dir, tag, device, batch_size, workers):
     """One pass over a traverse's slices, fanned out to every checkpoint. -> {label: path}"""
-    dataset = inf.EventStreamDataset(
-        args.dataset, traverse, inf.sequence_path(args, traverse), transform,
-        args.representation, args.dt_ms, inf.sensor_size(args.dataset),
-        hot_pixel=not args.no_hot_pixel,
-        filter_dt_us=args.filter_dt_us,
-    )
+    dataset = _slice_source(traverse, transform, args)
     n = len(dataset)
     files = {name: os.path.join(out_dir, f"{tag}_{traverse}_{name}.npy") for name, _, _ in loaded}
     if all(os.path.exists(p) for p in files.values()):

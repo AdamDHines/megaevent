@@ -53,6 +53,11 @@ except ImportError:                             # optional; without it BLAS keep
 # at 16 on an 8 GB card already hosting another job.
 KP_BATCH = 8
 
+# Query columns per shortlist partition block. Bounds the transient index array to
+# k x n_db x chunk rather than n_db x n_q; 512 keeps it under ~350 MB on the largest
+# split here (pitts250k, 83952 database images) at no measurable time cost.
+SHORTLIST_CHUNK = 512
+
 
 # ---------------------------------------------------------------------------
 # 1. Locating and building the model
@@ -289,7 +294,8 @@ class LocalReranker:
     """
 
     def __init__(self, model, config, fast_nms, device, size, cache_dir, tag, top_k,
-                 ransac_thresh, inlier_weight, match_filter, match_ratio):
+                 ransac_thresh, inlier_weight, match_filter, match_ratio,
+                 share_threshold=0.9):
         self.model, self.config, self.fast_nms = model, config, fast_nms
         self.device, self.size = device, tuple(size)
         self.cache_dir, self.tag = cache_dir, tag
@@ -297,6 +303,14 @@ class LocalReranker:
         self.ransac_thresh = float(ransac_thresh)
         self.inlier_weight = float(inlier_weight)
         self.match_filter, self.match_ratio = match_filter, float(match_ratio)
+        # Shortlist coverage above which the spaces share one whole-database store instead of
+        # each extracting its own union. The break-even is ``1 / n_spaces``: *S* unions each
+        # covering a fraction *c* of the database cost ``S * c * n_db`` extractions against
+        # ``n_db`` for the shared store, so sharing wins whenever ``c > 1 / S``. Callers that
+        # know *S* should pass it; 0.9 is the conservative default the Tokyo path has always
+        # used, where the shortlists cover only a sliver of the gallery and compaction is the
+        # whole point.
+        self.share_threshold = float(share_threshold)
         self._query_store = None
 
     def _store(self, paths, kind, dataset=None):
@@ -345,19 +359,20 @@ class LocalReranker:
         n_db = len(db_keys)
         dist = 1.0 - np.asarray(sims, dtype=np.float32)          # [k, n_q], upstream's units
         union = np.unique(shortlists)
-        # Same threshold as :meth:`rerank`. On a traverse the shortlists cover nearly the whole
-        # gallery, and the store is keyed on ``label``, so each descriptor space would extract
-        # and keep its own near-identical copy — 20 GB apiece on NSAVP. Widening the extracted
-        # set can only add rows no shortlist reads, so the re-ranking is unchanged and the
-        # spaces share one store.
-        if len(union) >= 0.9 * n_db:
+        covered = len(union)
+        # On a traverse the shortlists cover a large slice of the gallery, and a per-space store
+        # is keyed on ``label``, so each descriptor space would extract and keep its own
+        # near-identical copy — 11 GB apiece on NSAVP. Above ``share_threshold`` the spaces take
+        # one whole-database store instead: widening the extracted set can only add rows no
+        # shortlist reads, so the re-ranking is unchanged.
+        if covered >= self.share_threshold * n_db:
             union, store_tag = np.arange(n_db), "db"
         else:
             store_tag = f"{label}_db" if label else "db"
         row_of = np.full(n_db, -1, dtype=np.int64)
         row_of[union] = np.arange(len(union))
-        logger.info(f"[{label} rerank] top-{k} shortlists cover {len(np.unique(shortlists))} of "
-                    f"{n_db} database frames"
+        logger.info(f"[{label} rerank] top-{k} shortlists cover {covered} of {n_db} database "
+                    f"frames ({100 * covered / n_db:.1f}%)"
                     + ("" if store_tag != "db" else " — sharing one full-database store"))
 
         db_bank = open_keypoint_bank(self._store(
@@ -423,9 +438,17 @@ class LocalReranker:
 
         # Shortlists first: their union is what has to be extracted, and it is far smaller than
         # the database because Tokyo 24/7's queries cluster into ~100 distinct locations.
-        part = np.argpartition(dist, k - 1, axis=0)[:k]                 # [k, n_q], unordered
-        order = np.argsort(np.take_along_axis(dist, part, axis=0), axis=0)
-        shortlists = np.take_along_axis(part, order, axis=0)            # [k, n_q], nearest first
+        # Partitioned in column blocks, not in one call: ``argpartition`` over the whole
+        # matrix materialises an int64 index of the *full* shape before the ``[:k]`` slice
+        # throws almost all of it away -- 83952 x 8280 on pitts250k is 5.6 GB, on a box with
+        # ~22 GB free and three more full-matrix copies still to come. The partition is along
+        # axis 0, so it is independent per column and chunking is exactly equivalent.
+        shortlists = np.empty((k, n_q), dtype=np.int64)
+        for s in range(0, n_q, SHORTLIST_CHUNK):
+            block = dist[:, s:s + SHORTLIST_CHUNK]
+            part = np.argpartition(block, k - 1, axis=0)[:k]             # [k, chunk]
+            order = np.argsort(np.take_along_axis(block, part, axis=0), axis=0)
+            shortlists[:, s:s + SHORTLIST_CHUNK] = np.take_along_axis(part, order, axis=0)
         union = np.unique(shortlists)
         # Compaction pays for itself only while the shortlists cover a small slice of the
         # database, as Tokyo 24/7's do. A traverse inverts that: 14478 queries x top-50 over

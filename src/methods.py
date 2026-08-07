@@ -11,6 +11,7 @@ method           representation        encoder                    native metric
 ``sparse_event`` event count [H,W]     none (150-pixel readout)   L1
 ``eventvlad``    3 count sub-windows   denoiser + VGG16/NetVLAD   dot product
 ``eventgem``     MCTS [10,H,W]         SuperEvent + GeM(p=5)      cosine
+``spikevpr``     ON/OFF count [2,H,W]  SEW-ResNet34 + MixVPR      cosine
 ===============  ====================  =========================  ==============
 
 ``similarity`` always returns *higher is better*, because that is what
@@ -24,10 +25,12 @@ spaces beyond the shared whitening every method is reported under.
 
 sparse_event and eventvlad are ports of Event-LAB
 (https://github.com/EventLAB-Team/Event-LAB); eventgem is Event-GeM
-(https://github.com/AdamDHines/Event-GeM). See the per-class docstrings for the paper and the
+(https://github.com/AdamDHines/Event-GeM); spikevpr runs the released SpikeVPR checkpoints
+out of the vendored ``SpikeVPR/`` clone. See the per-class docstrings for the paper and the
 exact source lines each one follows.
 """
 
+import hashlib
 import os
 import sys
 
@@ -41,6 +44,7 @@ from src.inference import (
     eval_transform, extract_descriptors, load_model, sim_matrix,
 )
 from src.npzdata import load_count, load_count_triplet, load_countmask, load_mcts
+from src import spikevpr_bridge
 
 # sparse_event, "How Many Events Do You Need?" (Fischer & Milford, RA-L 2022)
 SPARSE_PIXELS = 150             # num_target_pixels, baselines/sparse_event.yaml
@@ -102,14 +106,26 @@ class MegaEventMethod:
 
     def __init__(self, args, device):
         self.device = device
-        self.model, self.cfg, self.step = load_model(
-            os.path.join(CKPT_DIR, f"{args.model}.pt"), device)
-        logger.info(f"{args.model} (step {self.step}): vit={self.cfg.vit} "
+        explicit = getattr(args, "ckpt", None)
+        ckpt = explicit or os.path.join(CKPT_DIR, f"{args.model}.pt")
+        self.model, self.cfg, self.step = load_model(ckpt, device)
+        label = os.path.splitext(os.path.basename(ckpt))[0]
+        checkpoint_sha256 = None
+        if explicit:
+            with open(ckpt, "rb") as handle:
+                checkpoint_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+        digest = checkpoint_sha256[:10] if checkpoint_sha256 else None
+        fingerprint = f", sha256 {digest}" if digest else ""
+        logger.info(f"{label} (step {self.step}{fingerprint}): vit={self.cfg.vit} "
                     f"agg={self.cfg.aggregator} desc={self.cfg.desc_dim} "
                     f"rep={self.cfg.representation} in={self.cfg.H}x{self.cfg.W}")
-        self.tag = f"{args.model}_{self.cfg.representation}"
-        self.meta = {"model": args.model, "step": self.step,
+        self.tag = (f"{label}_s{self.step}_{digest}_{self.cfg.representation}" if explicit
+                    else f"{args.model}_{self.cfg.representation}")
+        self.meta = {"model": label, "step": self.step,
                      "representation": self.cfg.representation}
+        if explicit:
+            self.meta.update({"checkpoint": os.path.abspath(ckpt),
+                              "checkpoint_sha256": checkpoint_sha256})
 
     def descriptors(self, paths, split):
         transform = eval_transform(self.cfg)
@@ -369,6 +385,17 @@ class EventVLADMethod:
                     f"(encoder epoch {self.meta['epoch']})")
 
     @torch.no_grad()
+    def encode(self, x):
+        x = x.to(self.device, non_blocking=True)
+        # denoiser channel 0 is the reconstruction; channel 1 is its error
+        # estimate and is discarded, as upstream does
+        gray = self.denoiser(x)[:, 0:1].clamp(0.0, 1.0) * 255.0
+        rgb = gray.repeat(1, 3, 1, 1)
+        rgb = torch.nn.functional.interpolate(
+            rgb, (EVENTVLAD_VGG_SIZE, EVENTVLAD_VGG_SIZE), mode="area")
+        return self.encoder(rgb - self.mean).reshape(x.size(0), -1).float()
+
+    @torch.no_grad()
     def descriptors(self, paths, split):
         from tqdm import tqdm
 
@@ -378,15 +405,8 @@ class EventVLADMethod:
         out = []
         with tqdm(total=len(ds), desc=split, unit="frame", disable=None, leave=False) as bar:
             for batch in _loader(ds, EVENTVLAD_BATCH):
-                x = batch.to(self.device, non_blocking=True)
-                # denoiser channel 0 is the reconstruction; channel 1 is its error
-                # estimate and is discarded, as upstream does
-                gray = self.denoiser(x)[:, 0:1].clamp(0.0, 1.0) * 255.0
-                rgb = gray.repeat(1, 3, 1, 1)
-                rgb = torch.nn.functional.interpolate(
-                    rgb, (EVENTVLAD_VGG_SIZE, EVENTVLAD_VGG_SIZE), mode="area")
-                out.append(self.encoder(rgb - self.mean).float().cpu())
-                bar.update(x.size(0))
+                out.append(self.encode(batch).cpu())
+                bar.update(batch.size(0))
         return torch.cat(out)
 
     def similarity(self, ref, qry, device):
@@ -440,6 +460,12 @@ class EventGeMMethod:
         from src import eventgemlocal as egl
 
         self.device = device
+        # Each extra whitening power costs a full re-rank pass, and on a large gallery that
+        # means its own keypoint store: pca1's shortlists cover the whole pitts250k database,
+        # so its store is 13.9 GB and thrashes a 31 GB box. --no-extra-pca drops those spaces
+        # and reports only the shared PCA_POWER.
+        if getattr(args, "no_extra_pca", False):
+            self.extra_pca_powers = ()
         egl.add_to_path(args)
         self.model, self.cfg, self.fast_nms = egl.build_superevent(
             egl.superevent_root(args), device)
@@ -521,6 +547,84 @@ class EventGeMMethod:
 
 
 # ---------------------------------------------------------------------------
+# 5. SpikeVPR
+# ---------------------------------------------------------------------------
+class SpikeVPRMethod:
+    """A spiking SEW-ResNet34 + MixVPR head on ON/OFF count frames, L2-normalised, cosine.
+
+    "Event-Driven Neuromorphic Vision Enables Energy-Efficient Visual Place Recognition",
+    Keime, Cuperlier & Cottereau, arXiv:2604.03277. The model and its three released
+    checkpoints come from the vendored ``SpikeVPR/`` clone unmodified; what is decided here
+    is the input, and there are two things to know about it.
+
+    **The frame is raw counts.** The network has no input normalisation — a ``BatchNorm2d``
+    on frozen training statistics is the first thing the events meet — so the event *rate*
+    is part of the model's contract in a way it is not for the other four methods. Against
+    the 0.167 events/px SpikeVPR's Brisbane checkpoint trained on, the measured medians on
+    this grid are 0.278 for a Brisbane 50 ms slice and 1.878 for an NSAVP one (both within
+    ~1.7x of their own checkpoint's window), 0.621 for NYC, ~2.1-4.2 for MSLS and Pitts, and
+    7.2-8.4 for Tokyo 24/7, whose I2E saccades pack ~600k events into 29 ms. The protocol is
+    unchanged either way — SpikeVPR sees the same events every other method sees — but that
+    is what ``--spikevpr-max-events`` exists for, and why ``scripts/spikevpr_health.py``
+    should confirm a bank has not collapsed to a near-constant descriptor before its recall
+    is believed.
+
+    **The grid is not a choice.** ``spikevpr.models.factory`` hardcodes MixVPR for the
+    (512, 9, 11) feature map a (2, 260, 346) input produces, so every dataset is resized to
+    260x346 — in the event domain, as :func:`src.npzdata.onoff_from_stream` explains. Tokyo
+    24/7's 640x480 and 480x854 splits therefore meet on it having been squashed by different
+    amounts, the same compromise sparse_event and eventgem already make.
+
+    The forward pass itself runs in ``envs/spikevpr`` rather than here; see
+    :mod:`src.spikevpr_bridge` for why and how.
+    """
+
+    name = "spikevpr"
+    native_metric = "cosine"
+    multi_seed = False
+
+    def __init__(self, args, device):
+        self.device = device
+        model = args.spikevpr_model
+        repo = args.spikevpr_repo
+        checkpoint, neuron = spikevpr_bridge.resolve_checkpoint(model, repo)
+        digest = spikevpr_bridge.checkpoint_sha256(checkpoint)
+
+        self.checkpoint, self.neuron, self.model = checkpoint, neuron, model
+        self.repo, self.env_dir = repo, args.spikevpr_env
+        self.max_events = args.spikevpr_max_events
+        self.out_dir = os.path.join(args.feature_dir, args.dataset)
+        self.suffix = f"_limit{args.limit}" if getattr(args, "limit", None) else ""
+
+        # The checkpoint stem alone would be enough to tell the three apart, but the digest
+        # follows MegaEventMethod's precedent: it is what makes a bank traceable to the
+        # bytes that produced it rather than to a filename that could be replaced.
+        cap = f"_e{self.max_events}" if self.max_events else ""
+        self.tag = f"spikevpr_r34_{model}_{digest[:10]}{cap}"
+        self.meta = {"checkpoint": checkpoint, "checkpoint_sha256": digest,
+                     "trained_on": model, "neuron": neuron,
+                     "encoder": spikevpr_bridge.ENCODER,
+                     "descriptor_dim": spikevpr_bridge.OUT_CHANNELS * spikevpr_bridge.OUT_ROWS,
+                     "grid": list(spikevpr_bridge.GRID),
+                     "event_window": ("full stream" if not self.max_events
+                                      else f"first {self.max_events} events")}
+        logger.info(f"SpikeVPR {spikevpr_bridge.ENCODER} trained on {model} "
+                    f"(sha256 {digest[:10]}, MixVPR {neuron}): "
+                    f"{self.meta['descriptor_dim']}-d, in={spikevpr_bridge.GRID[0]}x"
+                    f"{spikevpr_bridge.GRID[1]}, {self.meta['event_window']}")
+
+    def descriptors(self, paths, split):
+        out = os.path.join(self.out_dir, f"{self.tag}_{split}{self.suffix}_bank.npy")
+        job = spikevpr_bridge.npz_job(
+            paths, checkpoint=self.checkpoint, neuron=self.neuron, out=out,
+            max_events=self.max_events, spikevpr_repo=self.repo, label=split)
+        return torch.from_numpy(spikevpr_bridge.run(job, self.env_dir))
+
+    def similarity(self, ref, qry, device):
+        return sim_matrix(ref, qry, device)          # the MixVPR head L2-normalises
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 METHODS = {
@@ -528,6 +632,7 @@ METHODS = {
     "sparse_event": SparseEventMethod,
     "eventvlad": EventVLADMethod,
     "eventgem": EventGeMMethod,
+    "spikevpr": SpikeVPRMethod,
 }
 
 

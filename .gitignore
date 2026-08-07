@@ -225,3 +225,6 @@ __marimo__/
 features/
 # Event-GeM is vendored as a plain clone until it is promoted to a submodule
 external/eventgem/
+SpikeVPR/
+pittsinfo/
+envs/

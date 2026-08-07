@@ -46,6 +46,7 @@ sys.path.insert(0, HERE)
 from src import inference as inf  # noqa: E402
 from src import scoring  # noqa: E402
 from src import traversegps as tg  # noqa: E402
+from src import traversenpz as tnpz  # noqa: E402
 from src.imagevpr import build_gt, figure_error_map  # noqa: E402
 from brisbane_resolution import _Args, extract  # noqa: E402
 from tokyo_trajectory import load_all, parse_pca  # noqa: E402
@@ -161,8 +162,14 @@ def assert_filter_active(args, traverse, filter_dt_us, n_probe=12):
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
-def traverse_geometry(args, sequences, npz_root):
-    """{seq: (xy, covered, speed, info)} in one shared local ENU frame."""
+def traverse_geometry(args, sequences, npz_root, aps_align=False):
+    """{seq: (xy, covered, speed, info)} in one shared local ENU frame.
+
+    ``aps_align`` additionally drops every frame with no APS frame within half a slice. That
+    mask describes the *alignment* between the recorded and simulated arms, not the event
+    source, so it has to be applied to both or neither — masking only the synthetic arm would
+    score a real frame against a duplicated one and report the difference as a domain gap.
+    """
     lat0, lon0 = tg.track_origin(args.eventlab_dir, args.dataset, sequences)
     print(f"  projection origin ({lat0:.6f}, {lon0:.6f})")
     geom = {}
@@ -170,6 +177,15 @@ def traverse_geometry(args, sequences, npz_root):
         geom[seq] = tg.frame_coords(args.eventlab_dir, args.dataset, seq, lat0, lon0,
                                     args.dt_ms, npz_root=npz_root)
         info = geom[seq][3]
+        if aps_align:
+            xy, covered, speed, info = geom[seq]
+            aps = tnpz.aps_validity_mask(npz_root, args.dataset, seq, len(covered))
+            dropped = int((covered & ~aps).sum())
+            info = {**info, "aps_unaligned": dropped,
+                    "aps_unaligned_fraction": float(dropped / max(len(covered), 1))}
+            geom[seq] = (xy, covered & aps, speed, info)
+            print(f"    {seq:9s} APS alignment drops {dropped} of {int(covered.sum())} "
+                  f"GPS-covered frames ({dropped / max(int(covered.sum()), 1):.1%})")
         print(f"    {seq:9s} {info['n_frames']:6d} frames  {info['n_gps_fixes']:4d} GPS fixes  "
               f"{info['uncovered']:4d} outside GPS span  route {info['route_len_m']:.0f} m"
               + ("  [slice_times verified]" if info["slice_times_checked"] else ""))
@@ -336,11 +352,16 @@ def score_configuration(bank_files, geom, args, cli, label, device, tag):
 
     subtitle = (f"{cli.query} -> {'+'.join(cli.database)}  |  {out['n_database']} database x "
                 f"{out['scorable']} scorable queries, {cli.threshold_m:g} m")
+    # ``fig_tag`` separates the figure filename from the result key. They are the same thing for
+    # a single-dataset run, but a caller that scores several datasets into one directory needs
+    # them apart: the tag encodes only the run config (resolution, filter arm), so two datasets
+    # produce the same tag and the second silently overwrites the first's figures.
+    fig_tag = getattr(cli, "fig_tag", None) or tag
     scoring.figure_recall_curve(curves, subtitle,
-                                os.path.join(cli.out_dir, f"recall_curve_{tag}.png"))
+                                os.path.join(cli.out_dir, f"recall_curve_{fig_tag}.png"))
     ranked, scorable, gt = first
     figure_error_map(db_xy, q_xy, ranked[:, scorable], gt, scorable, cli.threshold_m,
-                     os.path.join(cli.out_dir, f"error_map_{tag}.png"))
+                     os.path.join(cli.out_dir, f"error_map_{fig_tag}.png"))
     del db_desc, q_desc, gt
     return out
 
@@ -373,6 +394,18 @@ def main():
                     help="eventcv background-activity window in MICROseconds (its native "
                          "timestamp unit). 50000 = the 50 ms window, retaining ~84%% of "
                          "active pixels.")
+    ap.add_argument("--source", default="real", choices=list(tnpz.SOURCES),
+                    help="which arm the events come from. `real` (default) reads the HDF5 "
+                         "recording through eventcv and is the only source the traverses "
+                         "without an npz tree have. The others read "
+                         "<npz-root>/<dataset>/<source>/<seq>/frame_*.npz — I2E micro-"
+                         "saccades over the co-recorded DAVIS APS frames, and the vignette-"
+                         "masked variants of both. Anything but `real` implies "
+                         "--aps-aligned and forces the filter arm off.")
+    ap.add_argument("--aps-aligned", action="store_true",
+                    help="drop frames with no APS frame within half a slice. Implied by a "
+                         "non-real --source, and available on `real` so the two arms of a "
+                         "Sim2Real comparison are scored on exactly the same rows.")
     ap.add_argument("--eventlab-dir", default=DEFAULT_EVENTLAB)
     ap.add_argument("--npz-root", default=DEFAULT_NPZ_ROOT)
     ap.add_argument("--unfiltered-bank-dir", default=DEFAULT_UNFILTERED_BANKS)
@@ -394,7 +427,18 @@ def main():
     os.makedirs(cli.out_dir, exist_ok=True)
     sequences = [cli.query, *cli.database]
 
-    args = _Args(cli.eventlab_dir, cli.dataset, cli.dt_ms, cli.no_hot_pixel, True)
+    synthetic = cli.source != "real"
+    if synthetic:
+        # The background-activity filter removes sensor read noise. I2E has none to remove,
+        # and assert_filter_active would abort on a retention ratio that cannot be met.
+        if cli.arms != ["off"]:
+            print(f"  --source {cli.source}: forcing the filter arm off — background-"
+                  f"activity denoising is meaningless on simulated events")
+            cli.arms = ["off"]
+        cli.aps_aligned = True
+
+    args = _Args(cli.eventlab_dir, cli.dataset, cli.dt_ms, cli.no_hot_pixel, True,
+                 source=cli.source, npz_root=cli.npz_root)
     head = torch.load(pairs[0][1], map_location="cpu", weights_only=False)
     args.representation = inf.cfg_from_ckpt(head).representation
     del head
@@ -405,7 +449,7 @@ def main():
     print(f"  {cli.threshold_m:g} m radius, dt {cli.dt_ms} ms, {args.representation}, "
           f"hot-pixel {not cli.no_hot_pixel}, arms {cli.arms}")
 
-    geom = traverse_geometry(args, sequences, cli.npz_root)
+    geom = traverse_geometry(args, sequences, cli.npz_root, aps_align=cli.aps_aligned)
 
     all_results = {}
     for arm in cli.arms:
@@ -414,8 +458,16 @@ def main():
         if arm == "on":
             assert_filter_active(args, cli.query, cli.event_filter_dt_us)
         for resolution in cli.resolutions:
-            tag = f"r{resolution}" if arm == "off" else f"r{resolution}ba{cli.dt_ms}"
-            bank_dir = cli.unfiltered_bank_dir if arm == "off" else cli.out_dir
+            if synthetic:
+                # A distinct tag and the run's own directory. Without both, a synthetic arm
+                # would be written as `r322` into --unfiltered-bank-dir and silently
+                # overwrite — or worse, silently reuse — the real unfiltered banks that
+                # scripts/brisbane_resolution.py put there.
+                tag = f"r{resolution}_{cli.source}"
+                bank_dir = cli.out_dir
+            else:
+                tag = f"r{resolution}" if arm == "off" else f"r{resolution}ba{cli.dt_ms}"
+                bank_dir = cli.unfiltered_bank_dir if arm == "off" else cli.out_dir
             print(f"\n{'=' * 78}\n{tag}  (filter {arm}, banks in {bank_dir})\n{'=' * 78}")
 
             loaded, transform = load_all(pairs, device, resolution)
@@ -439,6 +491,8 @@ def main():
                 res = score_configuration(bank_files, geom, args, cli, label, device, key)
                 res["filter_arm"] = arm
                 res["event_filter_dt_us"] = None if arm == "off" else cli.event_filter_dt_us
+                res["source"] = cli.source
+                res["aps_aligned"] = bool(cli.aps_aligned)
                 res["resolution"] = resolution
                 res["checkpoint"] = path
                 res["label"] = label
@@ -452,6 +506,7 @@ def main():
                                "query": cli.query, "database": list(cli.database),
                                "threshold_m": cli.threshold_m, "dt_ms": cli.dt_ms,
                                "pca": [list(s) for s in cli.pca],
+                               "source": cli.source, "aps_aligned": bool(cli.aps_aligned),
                                "hot_pixel": not cli.no_hot_pixel, "results": all_results},
                               handle, indent=2)
                 os.replace(tmp, out_json)           # a reader never sees a half-written file

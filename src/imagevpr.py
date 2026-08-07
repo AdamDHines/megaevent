@@ -1,16 +1,15 @@
-"""Image-set VPR: a folder of per-image event streams scored against geographic ground truth.
+"""Image-set VPR: independent event streams scored against per-image ground truth.
 
     <split>/*.npz  --eventcv--> countmask [3,H,W] uint8
       --normalise + resize--> ViT-S/14 + SALAD --> L2-normalised descriptor
-    cosine similarity against the database bank --> R@k over a 25 m UTM radius
+    cosine similarity against the database bank --> R@k over dataset positives
 
 The counterpart of :mod:`src.inference`, which handles *continuous traverses*: one long
 recording sliced into ``dt_ms`` windows, scored against an Event-LAB ground-truth band.
-Here each file is one independent image with no temporal ordering, and a retrieval is
-correct when the retrieved database image was taken within
-``--positive-dist-threshold`` metres of the query — the classic Recall@N of the NetVLAD
-line of VPR papers. Everything downstream of loading (model, descriptors, PCA, metric) is
-imported from :mod:`src.inference` rather than reimplemented.
+Here each file is one independent image with no temporal ordering. Tokyo/NYC derive
+positives from a metric radius, Pitts supplies an explicit positive list, and MSLS uses
+its official per-city 25 m protocol. Everything downstream of loading (model,
+descriptors, PCA, metric) is imported from :mod:`src.inference` rather than reimplemented.
 
 Only the *geographic* half lives here: building the ground truth from UTM coordinates, the
 error map that plots it, and the smoke-test subset that picks database images by distance.
@@ -42,11 +41,11 @@ import torch
 from loguru import logger
 from matplotlib import pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
-from sklearn.neighbors import NearestNeighbors
 
 from src.inference import C_FP, C_MUTED, C_TEXT, C_TP, KS
+from src.imagesets import build_radius_gt, load_image_set
 from src.methods import get_method
-from src.npzdata import list_npz, load_countmask, split_dir, utm_from_paths  # noqa: F401
+from src.npzdata import load_countmask  # noqa: F401
 # The dataset-agnostic half of this evaluation, shared with src.traversevpr. Imported
 # under the private names it used to define so that importers predating the split
 # (src.eventgemlocal, scripts/verify_*.py) keep working unchanged.
@@ -78,12 +77,7 @@ def build_gt(db_utm, q_utm, threshold_m):
     ``TestDataset``: positives are every database image inside a metric radius of the
     query, found with a KD-tree rather than a dense distance matrix.
     """
-    nn = NearestNeighbors(n_jobs=-1).fit(db_utm)
-    positives = nn.radius_neighbors(q_utm, radius=threshold_m, return_distance=False)
-    gt = np.zeros((len(db_utm), len(q_utm)), dtype=bool)
-    for j, idx in enumerate(positives):
-        gt[idx, j] = True
-    return gt
+    return build_radius_gt(db_utm, q_utm, threshold_m)
 
 
 # ---------------------------------------------------------------------------
@@ -142,15 +136,10 @@ def run(args):
 
     method = get_method(args.method, args, device)
 
-    db_paths = list_npz(split_dir(args, args.ref))
-    q_paths = list_npz(split_dir(args, args.query))
-    q_utm = utm_from_paths(q_paths)
-    if getattr(args, "limit", None):
-        db_paths = _limit_database(db_paths, q_utm, args.limit)
-    db_utm = utm_from_paths(db_paths)
+    dataset = load_image_set(args)
+    db_paths, q_paths, gt = dataset.db_paths, dataset.q_paths, dataset.gt
     logger.info(f"{args.dataset}: {len(db_paths)} {args.ref} x {len(q_paths)} {args.query}")
 
-    gt = build_gt(db_utm, q_utm, args.positive_dist_threshold)
     per_query = gt.sum(0)
     scorable = int((per_query > 0).sum())
     logger.info(f"ground truth @ {args.positive_dist_threshold:g} m: {scorable}/{len(q_paths)} "
@@ -170,6 +159,8 @@ def run(args):
                "native_metric": method.native_metric, "database": args.ref,
                "queries": args.query, "n_database": len(db_paths),
                "n_queries": len(q_paths), "threshold_m": args.positive_dist_threshold,
+               "excluded_database": dataset.excluded_db,
+               "excluded_queries": dataset.excluded_q,
                "scorable_queries": scorable,
                "positives_per_query_mean": float(per_query.mean()),
                "recall": {}, "recall_curve": {}, **{"meta": method.meta}}
@@ -217,45 +208,41 @@ def run(args):
         q_desc = torch.from_numpy(np.asarray(cached_array(
             args, method, args.query, q_paths, "",
             lambda p, s: method.descriptors(p, s), "descriptors")))
-        native, pca_out = _score_both(method, db_desc, q_desc, gt, device, results, curves,
-                                      paths=(db_paths, q_paths))
+        native, pca_out = _score_both(
+            method, db_desc, q_desc, gt, device, results, curves,
+            paths=(db_paths, q_paths), map_ks=KS if args.dataset == "msls" else ())
         np.save(os.path.join(out_dir, f"sim_{method.tag}_{args.ref}_{args.query}{suffix}.npy"),
                 native[4])
         rec, curve, ranked, mask, sim = pca_out
     del sim
 
-    with open(os.path.join(out_dir, f"results_{method.name}{suffix}.json"), "w") as f:
+    artifact_tag = method.tag
+    if args.dataset == "msls":
+        ranking_space = next(reversed(curves))
+        results["ranking_space"] = ranking_space
+        ranking_path = os.path.join(out_dir,
+                                    f"predictions_{artifact_tag}_{ranking_space}{suffix}.txt")
+        q_indexes = np.flatnonzero(mask)
+        with open(ranking_path, "w") as handle:
+            for column, query in enumerate(q_indexes):
+                keys = [dataset.db_keys[index] for index in ranked[:, column]]
+                handle.write(" ".join([dataset.q_keys[query], *keys]) + "\n")
+    with open(os.path.join(out_dir, f"results_{artifact_tag}{suffix}.json"), "w") as f:
         json.dump(results, f, indent=2)
 
     figure_recall_curve(
         curves,
         f"{args.dataset} / {method.name}: {len(db_paths)} database x {scorable} scorable "
         f"queries, {args.positive_dist_threshold:g} m",
-        os.path.join(out_dir, f"recall_curve_{method.name}{suffix}.png"))
+        os.path.join(out_dir, f"recall_curve_{artifact_tag}{suffix}.png"))
     # The montage and the map describe the PCA-whitened space, the stronger of the two,
     # so the failures they show are the ones actually worth looking at.
     figure_retrievals(db_paths, q_paths, ranked, gt, mask,
-                      os.path.join(out_dir, f"retrievals_{method.name}{suffix}.png"))
-    figure_error_map(db_utm, q_utm, ranked, gt, mask, args.positive_dist_threshold,
-                     os.path.join(out_dir, f"error_map_{method.name}{suffix}.png"))
+                      os.path.join(out_dir, f"retrievals_{artifact_tag}{suffix}.png"))
+    if dataset.db_utm is not None:
+        figure_error_map(dataset.db_utm, dataset.q_utm, ranked, gt, mask,
+                         args.positive_dist_threshold,
+                         os.path.join(out_dir, f"error_map_{artifact_tag}{suffix}.png"))
 
     logger.info(f"artifacts -> {out_dir}")
     return results
-
-
-def _limit_database(db_paths, q_utm, limit):
-    """The ``limit`` database images closest to any query — a smoke-test subset.
-
-    A *random* subset of this size would leave nearly every query with no positive
-    (76k images, ~118 positives per query, so 64 random ones hit ~0.1 per query) and the
-    run would die on an undefined recall before exercising anything. Taking the nearest
-    instead keeps the metric well-defined; the recall it reports is not comparable to a
-    full run and is not meant to be.
-    """
-    db_utm = utm_from_paths(db_paths)
-    nn = NearestNeighbors(n_neighbors=1, n_jobs=-1).fit(q_utm)
-    dist, _ = nn.kneighbors(db_utm)
-    keep = np.argsort(dist[:, 0])[:limit]
-    logger.warning(f"--limit {limit}: using the {limit} database images nearest a query "
-                   f"(smoke test only — the recall is not comparable to a full run)")
-    return [db_paths[i] for i in sorted(keep)]

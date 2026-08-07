@@ -1,4 +1,4 @@
-"""Event-GeM's global stage under the pooled traverse protocol, on Brisbane and NSAVP.
+"""Event-GeM, both stages, under the pooled traverse protocol, on Brisbane and NSAVP.
 
 Run from the repo root::
 
@@ -53,6 +53,7 @@ sys.path.insert(0, HERE)
 
 from src import inference as inf  # noqa: E402
 from src import nsavpgps as ng  # noqa: E402
+from src import traversenpz as tnpz  # noqa: E402
 from brisbane_resolution import _Args  # noqa: E402
 import brisbane_pooled as bp  # noqa: E402
 import nsavp_pooled as npl  # noqa: E402
@@ -140,6 +141,23 @@ class MctsStreamDataset(Dataset):
         return {**self.__dict__, "_reader": None}
 
 
+def mcts_source(args, cli, traverse):
+    """One traverse's MCTS frames, from the recording or from a dumped Sim2Real arm.
+
+    Used for both the descriptor pass and the re-ranker's frame lookup, so a synthetic arm
+    cannot end up re-ranking against real frames — which would silently make the comparison
+    a real-vs-real one for every candidate.
+    """
+    source = getattr(args, "source", "real")
+    if source == "real":
+        return MctsStreamDataset(
+            args.dataset, traverse, inf.sequence_path(args, traverse), cli.eventgem_size,
+            args.dt_ms, inf.sensor_size(args.dataset), hot_pixel=not args.no_hot_pixel,
+            filter_dt_us=args.filter_dt_us)
+    paths = tnpz.frame_paths(cli.npz_root, args.dataset, source, traverse)
+    return tnpz.NpzTraverseDataset(paths, tnpz.mcts_loader(cli.eventgem_size))
+
+
 class PooledFrames(Dataset):
     """The pooled gallery (or the query set) as one indexable MCTS frame source.
 
@@ -176,6 +194,30 @@ class PooledFrames(Dataset):
         return self.streams[seq][int(local)]
 
 
+def make_rank_fn(reranker, db_frames, q_frames, cli):
+    """A ``score_configuration`` ``rank_fn`` that yields both Event-GeM stages per space.
+
+    The global stage's top-``--eventgem-top-k`` is what the second pass re-orders, so the
+    shortlist is retrieved once at *k* = 50 and the two rankings are then cut to the 20 the
+    scorer reads. ``topk_ranked`` returns the cosine similarities alongside the indices because
+    upstream re-scores in ``1 - sim`` distance: without the actual similarities the base
+    distances would have to be recomputed, and ``inlier_weight`` is calibrated against that
+    scale rather than against ranks.
+    """
+    db_keys, q_keys = db_frames.keys, q_frames.keys
+    top = max(bp.KS)
+
+    def rank_fn(name, db_space, q_space, device):
+        k = min(max(cli.eventgem_top_k, top), db_space.size(0))
+        idx, sims = bp.topk_ranked(db_space, q_space, device, k=k, chunk=cli.score_chunk,
+                                   db_chunk=cli.db_chunk, return_scores=True)
+        reranked = reranker.rerank_shortlists(idx, sims, db_keys, q_keys, label=name,
+                                              db_dataset=db_frames, q_dataset=q_frames)
+        return {name: idx[:top], f"{name}+rerank": reranked[:top]}
+
+    return rank_fn
+
+
 @torch.no_grad()
 def extract(model, cfg, crop, traverse, args, cli, out_dir, tag, device):
     """One pass over a traverse -> ``({label: path}, n_frames)``, matching ``extract``'s contract.
@@ -188,9 +230,7 @@ def extract(model, cfg, crop, traverse, args, cli, out_dir, tag, device):
     import time
 
     files = {"eventgem": os.path.join(out_dir, f"{tag}_{traverse}_eventgem.npy")}
-    ds = MctsStreamDataset(args.dataset, traverse, inf.sequence_path(args, traverse),
-                           cli.eventgem_size, args.dt_ms, inf.sensor_size(args.dataset),
-                           hot_pixel=not args.no_hot_pixel, filter_dt_us=args.filter_dt_us)
+    ds = mcts_source(args, cli, traverse)
     n = len(ds)
     if os.path.exists(files["eventgem"]):
         print(f"    {tag} {traverse}: {n} slices — bank cached, skipping")
@@ -249,6 +289,14 @@ def main():
     ap.add_argument("--inlier-weight", type=float, default=0.05)
     ap.add_argument("--match-filter", default="mutual", choices=["mutual", "ratio"])
     ap.add_argument("--match-ratio", type=float, default=0.8)
+    ap.add_argument("--source", default="real", choices=list(tnpz.SOURCES),
+                    help="which arm the events come from; see scripts/brisbane_pooled.py. "
+                         "Anything but `real` reads the dumped npz tree, implies APS "
+                         "alignment and forces the filter arm off.")
+    ap.add_argument("--aps-aligned", action="store_true",
+                  help="drop frames with no APS frame within half a slice. "
+                       "Implied by a non-real --source; pass it on `real` so "
+                       "both arms of a Sim2Real pair score the same rows.")
     ap.add_argument("--eventlab-dir", default=None)
     ap.add_argument("--npz-root", default=None)
     ap.add_argument("--out-dir", default=DEFAULT_OUT)
@@ -274,12 +322,23 @@ def main():
     os.makedirs(cli.out_dir, exist_ok=True)
     sequences = [cli.query, *cli.database]
 
-    args = _Args(cli.eventlab_dir, cli.dataset, cli.dt_ms, cli.no_hot_pixel, True)
+    synthetic = cli.source != "real"
+    if synthetic:
+        cli.aps_aligned = True
+        if cli.arms != ["off"]:
+            print(f"  --source {cli.source}: forcing the filter arm off — background-"
+                  f"activity denoising is meaningless on simulated events")
+            cli.arms = ["off"]
+        if cli.dataset != "brisbane_event":
+            raise SystemExit(f"--source {cli.source} exists only for brisbane_event")
+
+    args = _Args(cli.eventlab_dir, cli.dataset, cli.dt_ms, cli.no_hot_pixel, True,
+                 source=cli.source, npz_root=cli.npz_root)
     args.eventgem_repo = cli.eventgem_repo
 
     from src import eventgemlocal as egl
     egl.add_to_path(args)
-    model, cfg, _ = egl.build_superevent(egl.superevent_root(args), device)
+    model, cfg, fast_nms = egl.build_superevent(egl.superevent_root(args), device)
     crop = egl.crop_offsets(*cli.eventgem_size, egl.input_multiple(cfg))
 
     print(f"eventgem/{cli.dataset}: query {cli.query} -> database {'+'.join(cli.database)}")
@@ -290,13 +349,17 @@ def main():
         root = os.path.join(cli.eventlab_dir, cli.dataset)
         geom = npl.traverse_geometry(root, sequences, cli.dt_ms)
     else:
-        geom = bp.traverse_geometry(args, sequences, cli.npz_root)
+        geom = bp.traverse_geometry(args, sequences, cli.npz_root, aps_align=(synthetic or cli.aps_aligned))
 
     all_results = {}
     for arm in cli.arms:
         args.no_event_filter = (arm == "off")
         args.filter_dt_us = None if arm == "off" else cli.event_filter_dt_us
         tag = f"r{cli.eventgem_size[0]}" + ("" if arm == "off" else f"ba{cli.dt_ms}")
+        if synthetic:
+            # Distinct from the real arm's tag: same directory, and the bank filename is the
+            # only thing keeping the two apart.
+            tag = f"r{cli.eventgem_size[0]}_{cli.source}"
         print(f"\n{'=' * 78}\n{tag}  (filter {arm})\n{'=' * 78}")
 
         bank_files, bank_frames = {}, {}
@@ -314,10 +377,7 @@ def main():
 
         cli.rank_fn = None
         if cli.rerank:
-            streams = {seq: MctsStreamDataset(
-                args.dataset, seq, inf.sequence_path(args, seq), cli.eventgem_size,
-                args.dt_ms, inf.sensor_size(args.dataset), hot_pixel=not args.no_hot_pixel,
-                filter_dt_us=args.filter_dt_us) for seq in sequences}
+            streams = {seq: mcts_source(args, cli, seq) for seq in sequences}
             covered = {seq: geom[seq][1] for seq in sequences}
             db_frames = PooledFrames.build(streams, list(cli.database), covered)
             q_frames = PooledFrames.build(streams, [cli.query], covered)
@@ -326,21 +386,30 @@ def main():
                 cache_dir=os.path.join(cli.out_dir, "keypoints"),
                 tag=f"{cli.dataset}_{tag}", top_k=cli.eventgem_top_k,
                 ransac_thresh=cli.ransac_thresh, inlier_weight=cli.inlier_weight,
-                match_filter=cli.match_filter, match_ratio=cli.match_ratio)
+                match_filter=cli.match_filter, match_ratio=cli.match_ratio,
+                # native + one space per whitening setting, all re-ranked off the same frames.
+                share_threshold=1.0 / (len(cli.pca) + 1))
             cli.rank_fn = make_rank_fn(reranker, db_frames, q_frames, cli)
 
+        # Both datasets share --out-dir and produce the same tag, so the figures — unlike the
+        # banks and the results JSON — need the dataset in their name or the second run wins.
+        cli.fig_tag = f"{cli.dataset}_{tag}"
         res = bp.score_configuration(bank_files, geom, args, cli, "eventgem", device, tag)
         res["filter_arm"] = arm
         res["event_filter_dt_us"] = None if arm == "off" else cli.event_filter_dt_us
         res["method"] = "eventgem"
-        res["stage"] = "global"
+        res["stage"] = "global+rerank" if cli.rerank else "global"
+        res["rerank"] = ({"top_k": cli.eventgem_top_k, "ransac_thresh": cli.ransac_thresh,
+                          "inlier_weight": cli.inlier_weight, "match_filter": cli.match_filter,
+                          "match_ratio": cli.match_ratio} if cli.rerank else None)
         res["mcts_size"] = list(cli.eventgem_size)
         all_results[tag] = res
 
         out_json = os.path.join(cli.out_dir, cli.out_json)
         tmp = out_json + ".tmp"
         with open(tmp, "w") as handle:
-            json.dump({"dataset": cli.dataset, "method": "eventgem", "stage": "global",
+            json.dump({"dataset": cli.dataset, "method": "eventgem",
+                       "stage": "global+rerank" if cli.rerank else "global",
                        "query": cli.query, "database": list(cli.database),
                        "threshold_m": cli.threshold_m, "dt_ms": cli.dt_ms,
                        "pca": [list(s) for s in cli.pca],
@@ -350,12 +419,19 @@ def main():
 
     print(f"\n{'=' * 78}\nR@1 / R@10 by tolerance (best descriptor space)")
     for tag, res in all_results.items():
-        best = max(res["recall"], key=lambda s: res["recall"][s]["1"])
-        cells = "  ".join(
-            f"{t:g}m {res['recall_by_threshold'][f'{t:g}'][best]['1']:.3f}/"
-            f"{res['recall_by_threshold'][f'{t:g}'][best]['10']:.3f}"
-            for t in cli.thresholds_m)
-        print(f"  {tag:14s} [{best}]  {cells}")
+        # Ranked among the *global* spaces only, then shown beside its own re-ranked twin —
+        # picking the overall best would compare a second pass against a first one and hide
+        # what the re-ranking is actually worth.
+        globals_ = [s for s in res["recall"] if not s.endswith("+rerank")]
+        best = max(globals_, key=lambda s: res["recall"][s]["1"])
+        for name in (best, f"{best}+rerank"):
+            if name not in res["recall"]:
+                continue
+            cells = "  ".join(
+                f"{t:g}m {res['recall_by_threshold'][f'{t:g}'][name]['1']:.3f}/"
+                f"{res['recall_by_threshold'][f'{t:g}'][name]['10']:.3f}"
+                for t in cli.thresholds_m)
+            print(f"  {tag:14s} [{name:22s}]  {cells}")
     print(f"\n-> {os.path.join(cli.out_dir, cli.out_json)}")
 
 
