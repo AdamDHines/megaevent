@@ -34,7 +34,7 @@ from matplotlib import pyplot as plt
 from src.inference import (
     C_FP, C_MUTED, C_TEXT, C_TP, KS, PCA_POWER, pca_apply, pca_fit, recall_at_k, sim_matrix,
 )
-from src.npzdata import load_countmask
+from src.npzdata import load_accumulate, load_countmask
 
 # ---------------------------------------------------------------------------
 # Tunables that main.py does not expose
@@ -244,9 +244,17 @@ def figure_recall_curve(curves, subtitle, out_png):
     plt.close(fig)
 
 
-def display_frame(path):
-    """A countmask frame as ``[H, W, 3]`` uint8, for imshow."""
-    return np.transpose(load_countmask(path), (1, 2, 0))
+def display_frame(path, representation="countmask"):
+    """A rendered frame as ``[H, W, 3]`` uint8, for imshow.
+
+    ``representation`` must match what the descriptor bank being illustrated was
+    extracted with — a figure drawn in the other representation would show a frame
+    the model never saw.
+    """
+    renderers = {"countmask": load_countmask, "accumulate": load_accumulate}
+    if representation not in renderers:
+        raise ValueError(f"no display renderer for representation {representation!r}")
+    return np.transpose(renderers[representation](path), (1, 2, 0))
 
 
 def figure_retrievals(db_paths, q_paths, ranked, gt, scorable, out_png,

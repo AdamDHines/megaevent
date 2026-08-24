@@ -56,3 +56,6 @@ libcusolver-dev = "*"
 
 [pypi-dependencies]
 eventcv = {path = "/home/adam/repo/eventcv", editable = true}
+
+[dependencies]
+gdown = ">=6.1.0,<7"

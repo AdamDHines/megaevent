@@ -59,11 +59,20 @@ def main():
                              "use their standard query split by default.")
     parser.add_argument("--dt-ms", type=int, default=50,
                         help="Sets the time window in milliseconds for inference.")
-    parser.add_argument("--model", "-m", type=str, default="s_salad_ft4", choices=["s_salad_ft4", "s_gem_ft4"],
-                        help="Sets the model to be used for inference.")
+    parser.add_argument("--model", "-m", type=str, default="megaevent_vits_salad",
+                        choices=["megaevent_vitb_mloc", "megaevent_vitb_salad",
+                                 "megaevent_vits_mloc", "megaevent_vits_salad"],
+                        help="Checkpoint name under ckpts/ for the traverse path. The "
+                             "historical defaults (s_salad_ft4, s_gem_ft4) no longer ship; "
+                             "src/inference.py fails fast with the actual inventory if the "
+                             "file is missing.")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Explicit MegaEvent checkpoint. Required for nycevent so a "
                              "result never depends on a changing model-name default.")
+    parser.add_argument("--force-rebuild", action="store_true",
+                        help="Re-extract descriptors even when a cached bank exists — the "
+                             "escape hatch for a bank whose manifest no longer matches "
+                             "(checkpoint, resolution, or renderer changed).")
     parser.add_argument("--feature-dir", type=str, default="./features",
                         help="Sets the directory to save features.")
     # Event-LAB args
@@ -98,11 +107,45 @@ def main():
                              "<root>/<dataset>/<source>/<traverse>/frame_%%06d.npz.")
     # Comparison baselines (image datasets, or a traverse with --source)
     parser.add_argument("--method", type=str, default="megaevent",
-                        choices=["megaevent", "sparse_event", "eventvlad", "eventgem",
-                                 "spikevpr"],
-                        help="Which VPR method to evaluate. The baselines are ports of "
-                             "Event-LAB, Event-GeM and SpikeVPR, scored on identical data "
-                             "and ground truth.")
+                        choices=["megaevent", "megaloc", "salad", "mixvpr", "cricavpr",
+                                 "boq", "qaa", "supervlad",
+                                 "sparse_event", "eventvlad", "eventgem", "spikevpr", "lens"],
+                        help="Which VPR method to evaluate. The event baselines are ports of "
+                             "Event-LAB, Event-GeM, SpikeVPR and LENS v2, scored on "
+                             "identical data and ground truth. The RGB controls have never "
+                             "seen an event and run unretrained on the same countmask "
+                             "frames: 'megaloc' is the state of the art at 228.6M, 'salad' "
+                             "is megaevent's own architecture with the released RGB weights "
+                             "at the same 88.0M, 'cricavpr' is a third DINOv2 ViT-B model at "
+                             "106.8M, and 'mixvpr' is the CNN point at 10.9M. Note the RGB "
+                             "controls keep their own published input size — 322 for megaloc "
+                             "and salad, 320 for mixvpr, 224 for cricavpr.")
+    parser.add_argument("--eval-resolution", type=int, default=None,
+                        help="Square input size for the encoder, overriding the "
+                             "checkpoint's own. The traverse results are all at 322 "
+                             "(MegaLoc's and SALAD's evaluation size) while the image "
+                             "sets defaulted to the trained 224, so set it to compare "
+                             "one number against another. Banks and results are tagged "
+                             "with it, so nothing already on disk is overwritten.")
+    parser.add_argument("--representation", type=str, default=None,
+                        choices=["countmask", "accumulate"],
+                        help="Frame render for the RGB baselines (--method "
+                             "megaloc/salad/mixvpr/cricavpr), defaulting to countmask. "
+                             "'accumulate' is the GEPT-native white-background render the "
+                             "v8 MegaEvent models train on, so it is the arm that puts a "
+                             "control on the same frames as the model it is compared "
+                             "against. Bank tags carry it, so the countmask banks already "
+                             "on disk are never reused or overwritten. Not valid with "
+                             "--method megaevent, which reads the representation off its "
+                             "own checkpoint.")
+    parser.add_argument("--banks-only", action="store_true",
+                        help="Image sets: build and cache both splits' descriptors, then "
+                             "stop without scoring. Pitts250k is the one gallery whose "
+                             "dense [83952, 8280] matrix plus recallAtK's int64 argsort "
+                             "does not fit in 31 GB, so its banks are built here and "
+                             "scored by scripts/score_cached_banks.py, which streams. "
+                             "Without this the banks are still written before the scorer "
+                             "runs, but only because it crashes afterwards.")
     parser.add_argument("--eventlab-repo", type=str, default="/home/adam/repo/Event-LAB",
                         help="Event-LAB checkout supplying EventVLAD's networks and weights.")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4],
@@ -156,6 +199,32 @@ def main():
                              "7.2-8.4 events/px against the 0.167 these checkpoints were "
                              "trained on — and the network normalises its input with "
                              "nothing but a frozen BatchNorm.")
+    # LENS v2 args. The forward pass runs in LENS's own pixi environment (it needs sinabs
+    # to build the Speck network at all); see src/lens_bridge.py.
+    parser.add_argument("--lens-model", type=str, default="v2_best",
+                        help="A named LENS checkpoint ('v2_best') or a path to one. Sweep "
+                             "milestones are passed as paths.")
+    parser.add_argument("--lens-repo", type=str, default="/home/adam/repo/LENSV2",
+                        help="LENS v2 checkout supplying lens/* and its pixi manifest.")
+    parser.add_argument("--lens-quantise", type=str, default="chip",
+                        choices=["fp32", "chip"],
+                        help="Which network runs. 'chip' is the int8 DynapcnnNetwork that "
+                             "actually deploys and is the BETTER model here (Brisbane "
+                             "sunset1 R@1 60.8 -> 67.1), so it is the default; 'fp32' is "
+                             "the trained weights. They are different models, not one "
+                             "measured twice, and banks from the two are never mixed.")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Encoder batch size, a memory knob only — the descriptors are "
+                             "identical at any value (src/inference.py:288), so this is not "
+                             "part of the tag. Defaults to inference.BATCH_SIZE (64), which "
+                             "OOMs an 8 GB card on the 163.5M-parameter ViT-S projection "
+                             "model at 322; the pooled scripts already expose this and the "
+                             "image path was the one place it could not be reached.")
+    parser.add_argument("--lens-batch-size", type=int, default=64,
+                        help="Pinned, and part of the tag: sinabs makes the batch "
+                             "dimension visible to the network, so 64 and 128 produce "
+                             "different descriptors. 64 is what every published LENS "
+                             "number used.")
     # Event stream parameters
     parser.add_argument("--no-hot-pixel", action="store_true",
                         help="If set, disables hot pixel removal.")
@@ -178,10 +247,19 @@ def main():
                      f"set, where each file is already one independent event stream")
     if args.dataset == "nycevent" and args.method == "megaevent" and not args.ckpt:
         parser.error("nycevent MegaEvent inference requires --ckpt PATH")
+    if args.banks_only and not image_set:
+        parser.error(f"--banks-only applies to image sets; {args.dataset} is a traverse, "
+                     f"whose banks are built by the scripts/*_pooled.py runners")
+    if args.representation and args.method == "megaevent":
+        parser.error("--representation applies to the RGB baselines; --method megaevent "
+                     "restores the representation from its checkpoint (src/inference.py "
+                     "_RESTORE), so overriding it here would mis-describe the run")
     if args.method == "spikevpr" and not args.spikevpr_model:
         parser.error("--method spikevpr requires --spikevpr-model {brisbane,nsavp,nyc}")
     if args.spikevpr_model and args.method != "spikevpr":
         parser.error(f"--spikevpr-model applies to --method spikevpr, not {args.method}")
+    if args.method != "lens" and args.lens_model != parser.get_default("lens_model"):
+        parser.error(f"--lens-model applies to --method lens, not {args.method}")
     if not image_set and not args.source and args.method != "megaevent":
         # Without --source the traverse path reads the HDF5 stream directly and renders one
         # representation for one model, so it has no method abstraction to dispatch on. With

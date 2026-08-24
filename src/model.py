@@ -83,15 +83,17 @@ class VPRModel(nn.Module):
             print(f"[VPRModel] loaded encoder from {cfg.ckpt_path} (strict)")
 
         # ---- aggregator + projection ------------------------------------
-        # GeM -> linear proj to desc_dim. SALAD returns its own L2-normalised
-        # descriptor directly (MegaLoc-faithful, no projection): its dim is
-        # clusters*cluster_dim + token_dim (default 64*128+256 = 8448).
+        # GeM -> linear proj to desc_dim. SALAD emits its own L2-normalised descriptor of
+        # width clusters*cluster_dim + token_dim (default 64*128+256 = 8448) and by default
+        # that IS the descriptor — SALAD as published. A checkpoint trained with gept's
+        # --salad-proj carries MegaLoc's extra step instead: a wider aggregator learnedly
+        # compressed to desc_dim and re-normalised.
+        self.is_salad = cfg.aggregator == "salad"
         if cfg.aggregator == "gem":
             self.aggregator = GeMPool(p_init=cfg.gem_p_init, eps=cfg.gem_eps)
             self.proj = nn.Linear(cfg.n_embed, cfg.desc_dim)
         elif cfg.aggregator == "salad":
             from src.salad import FeatureAggregator
-            self.proj = None                # forward() branches on this
             self.aggregator = FeatureAggregator(
                 num_channels=cfg.n_embed,
                 num_clusters=cfg.salad_clusters,
@@ -100,6 +102,15 @@ class VPRModel(nn.Module):
                 mlp_dim=cfg.salad_mlp_dim,
                 dropout=cfg.salad_dropout,
             )
+            if getattr(cfg, "salad_proj", False):
+                # Derived rather than trusted: a checkpoint predating salad_out_dim would
+                # restore None, and the aggregator's width is fully determined by its own
+                # geometry anyway.
+                salad_out = getattr(cfg, "salad_out_dim", None) or (
+                    cfg.salad_clusters * cfg.salad_cluster_dim + cfg.salad_token_dim)
+                self.proj = nn.Linear(salad_out, cfg.desc_dim)
+            else:
+                self.proj = None            # forward() branches on this
         else:
             raise ValueError(f"Unknown aggregator '{cfg.aggregator}'")
 
@@ -169,8 +180,12 @@ class VPRModel(nn.Module):
     def forward(self, x):
         """[B,3,H,W] -> L2-normalised global descriptor."""
         feat, cls = self.forward_encoder(x)     # [B,C,h,w], [B,C]
-        if self.proj is None:                   # SALAD: (grid, cls) -> descriptor, already L2-normed
-            return self.aggregator((feat, cls))
-        pooled = self.aggregator(feat)          # GeM: [B, C]
-        desc = self.proj(pooled)                # [B, desc_dim]
-        return F.normalize(desc, p=2, dim=1)
+        if self.is_salad:
+            desc = self.aggregator((feat, cls))  # [B, salad_out_dim], already L2-normed
+            if self.proj is None:
+                return desc
+        else:
+            desc = self.aggregator(feat)        # GeM: [B, C]
+        # Normalised *after* the projection, as MegaLoc does: an L2-normalised input to a
+        # linear map does not come out normalised, and cosine retrieval requires that it is.
+        return F.normalize(self.proj(desc), p=2, dim=1)

@@ -95,6 +95,14 @@ class VPRConfig:
         # None -> random init. Path comes from GEPT_MEGALOC_WEIGHTS (a HF model.safetensors),
         # since compute nodes are offline; override with --megaloc-weights.
         self.salad_init = None             # None | "megaloc"
+        # MegaLoc's head is SALAD *plus* a learned compression: a 16640-d aggregator followed
+        # by Linear(16640 -> 8448) and an L2 norm. Ours is SALAD as published, emitting 8448
+        # directly. Checkpoints trained with gept's --salad-proj carry the extra layer, so the
+        # inference model has to be able to build it; these are restored from the checkpoint
+        # (see inference._RESTORE), never inferred.
+        self.salad_proj = False
+        self.salad_proj_dim = 8448
+        self.salad_out_dim = None          # aggregator width; None -> derived in the model
         self.megaloc_weights = os.environ.get("GEPT_MEGALOC_WEIGHTS", None)
 
         # ---- finetuning strategy (PLAN 1c / 1g / 1k) --------------------
@@ -306,7 +314,9 @@ class VPRConfig:
             self.salad_clusters, self.salad_cluster_dim = 64, 256
             self.salad_token_dim, self.salad_mlp_dim = 256, 512
         if self.aggregator == "salad":
-            self.desc_dim = self.salad_clusters * self.salad_cluster_dim + self.salad_token_dim
+            self.salad_out_dim = (self.salad_clusters * self.salad_cluster_dim
+                                  + self.salad_token_dim)
+            self.desc_dim = self.salad_proj_dim if self.salad_proj else self.salad_out_dim
         return self
 
     @property

@@ -17,6 +17,7 @@ Two properties of the shipped checkpoints that are easy to get wrong:
   single source of truth and must produce black-background frames.
 """
 
+import json
 import os
 import time
 
@@ -144,15 +145,44 @@ def _repr_kwargs(name, dt_ms):
     if name == "tencode":
         return {"window_ms": dt_ms}     # must equal dt_ms or the time channel is wrong
     if name == "countmask":
-        return {"window_ms": dt_ms, "white_frame": False}  # black background                   
+        return {"window_ms": dt_ms, "white_frame": False}  # black background
     return {}
+
+
+# Representations eventcv cannot render but checkpoints trained on them exist (the v8
+# wave trains on `accumulate`, the GEPT pretraining diet). Rendered locally from raw
+# eventcv slices via _RawRenderReader; eventcv stays authoritative wherever it can.
+from src.npzdata import accumulate_numpy as _accumulate_numpy  # noqa: E402
+
+_LOCAL_RENDERERS = {"accumulate": _accumulate_numpy}
+
+
+class _RawRenderReader:
+    """eventcv raw slices + a local renderer, for representations eventcv lacks.
+
+    Quacks like an eventcv repr-reader (``n_slices`` + indexable to ``[3,H,W]`` uint8).
+    The wrapped reader keeps all of eventcv's slicing, offsets and filters, so frame
+    indices — and therefore banks, manifests and GT — are identical to the built-in path.
+    """
+
+    def __init__(self, reader, render, sensor):
+        self._reader = reader
+        self._render = render
+        self._W, self._H = sensor              # eventcv's sensor_size is (W, H)
+        self.n_slices = reader.n_slices
+
+    def __getitem__(self, i):
+        ev = ecv.numpy(self._reader.slice(i))              # (N, 4) [x, y, t, p]
+        return self._render(ev[:, 0], ev[:, 1], ev[:, 2], ev[:, 3], self._H, self._W)
 
 
 class EventStreamDataset(Dataset):
     """Fixed ``dt_ms`` slices of one recording, rendered by eventcv into model inputs.
 
     The reader is opened lazily and never pickled (see ``__getstate__``): it is not
-    fork-safe, so each DataLoader worker has to build its own.
+    fork-safe, so each DataLoader worker has to build its own. Representations eventcv
+    cannot render (``accumulate``) fall back to raw slices + the local byte-verified
+    port in :mod:`src.npzdata` — see ``_LOCAL_RENDERERS``.
     """
 
     def __init__(self, dataset, traverse, path, transform, representation, dt_ms, sensor,
@@ -210,6 +240,12 @@ class EventStreamDataset(Dataset):
                                     **_repr_kwargs(self.representation, self.dt_ms))
         except ValueError as err:
             if "representation" in str(err):
+                if self.representation in _LOCAL_RENDERERS:
+                    # eventcv can slice but not render this representation: keep its
+                    # (filtered) raw slicing and render each slice with the byte-verified
+                    # local port instead — same events, same filters, same frame indices.
+                    return _RawRenderReader(reader, _LOCAL_RENDERERS[self.representation],
+                                            self.sensor)
                 raise ValueError(
                     f"the installed eventcv cannot render '{self.representation}', which is "
                     f"what this checkpoint was trained on ({err}). Upgrade eventcv to a "
@@ -243,7 +279,7 @@ _RESTORE = ("n_embed", "n_head", "num_register_tokens", "n_layer", "P", "backbon
             "H", "W", "n_tokens_per_image", "tencode_mean", "tencode_std", "aggregator",
             "desc_dim", "gem_p_init", "gem_eps", "representation",
             "salad_clusters", "salad_cluster_dim", "salad_token_dim", "salad_mlp_dim",
-            "salad_dropout")
+            "salad_dropout", "salad_proj", "salad_proj_dim", "salad_out_dim")
 
 
 def cfg_from_ckpt(ck):
@@ -282,9 +318,36 @@ def load_model(ckpt_path, device):
 # 4. Descriptors
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def extract_descriptors(model, ds, device, label=""):
-    """Descriptors for every frame of a traverse, in order. ``[N, D]`` float32 on CPU."""
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
+def _forward_batch(model, imgs, autocast, oom_backoff, label=""):
+    """``model(imgs)`` -> ``[B, D]`` float32 CPU tensor, halving the batch on a CUDA OOM."""
+    try:
+        with autocast:
+            return model(imgs).float().cpu()
+    except torch.cuda.OutOfMemoryError:
+        if not oom_backoff or imgs.shape[0] == 1:
+            raise
+        torch.cuda.empty_cache()
+        half = imgs.shape[0] // 2
+        logger.warning(f"{label}: CUDA OOM at batch {imgs.shape[0]} — retrying as "
+                       f"{half}+{imgs.shape[0] - half}")
+        return torch.cat([_forward_batch(model, imgs[:half], autocast, oom_backoff, label),
+                          _forward_batch(model, imgs[half:], autocast, oom_backoff, label)])
+
+
+def extract_descriptors(model, ds, device, label="", batch_size=BATCH_SIZE,
+                        oom_backoff=False):
+    """Descriptors for every frame of a traverse, in order. ``[N, D]`` float32 on CPU.
+
+    ``batch_size`` is only a memory knob — the descriptors are identical whatever it is.
+    The default fits an idle 8 GB card at 322x322; a caller sharing the GPU with another
+    job has to lower it, which is why it is a parameter rather than the constant it was.
+
+    ``oom_backoff`` halves a batch and retries when the card is out of memory, which is
+    sound only where the above holds. CricaVPR's cross-image encoder attends over the batch
+    axis, so its descriptors depend on which frames shared a batch and it must leave this
+    off: there a smaller batch is a different measurement, not a smaller footprint.
+    """
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=NUM_WORKERS,
                         pin_memory=True, drop_last=False)
     autocast = torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda"))
     out = []
@@ -295,8 +358,7 @@ def extract_descriptors(model, ds, device, label=""):
     with tqdm(total=len(ds), desc=label, unit="frame", disable=None, leave=False) as bar:
         for imgs in loader:
             imgs = imgs.to(device, non_blocking=True)
-            with autocast:
-                out.append(model(imgs).float().cpu())
+            out.append(_forward_batch(model, imgs, autocast, oom_backoff, label))
             bar.update(imgs.size(0))
     return torch.cat(out)
 
@@ -309,10 +371,68 @@ def _cache_path(args, cfg, seq):
     return os.path.join(args.feature_dir, args.dataset, name)
 
 
+def _file_sha256(path, chunk=1 << 22):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def cache_manifest(args, cfg, ckpt_path=None):
+    """Everything that changes a bank's contents but not its filename.
+
+    The filename covers model name, filters, dt and representation; it does NOT cover the
+    checkpoint's actual weights, the eval resolution, or the renderer version — the three
+    ways a stale bank has silently served the wrong descriptors before. ``ckpt_sha256`` is
+    the hash of the checkpoint file itself, so retraining under the same name invalidates.
+    """
+    ckpt_path = ckpt_path or os.path.join(CKPT_DIR, f"{args.model}.pt")
+    return {
+        "ckpt": os.path.basename(ckpt_path),
+        "ckpt_sha256": _file_sha256(ckpt_path) if os.path.exists(ckpt_path) else None,
+        "resolution": [int(cfg.H), int(cfg.W)],
+        "representation": cfg.representation,
+        "dt_ms": int(args.dt_ms),
+        "hot_pixel": not args.no_hot_pixel,
+        "filter_dt_us": None if args.no_event_filter
+        else int(args.event_filter_dt_ms or args.dt_ms) * 1000,
+        "eventcv": getattr(ecv, "__version__", "unknown"),
+    }
+
+
+def check_cache_manifest(path, manifest):
+    """``True`` if the cached bank at ``path`` may be reused under ``manifest``.
+
+    Missing manifest -> loud warning, reuse (legacy banks predate this check). Mismatched
+    manifest -> ``SystemExit`` naming the differing fields — a silently different bank is
+    the one failure mode worse than a slow rerun. ``--force-rebuild`` skips the cache
+    entirely at the call site rather than weakening this check.
+    """
+    mpath = path + ".manifest.json"
+    if not os.path.exists(mpath):
+        logger.warning(f"UNVERIFIED cache: {path} has no manifest — it predates the "
+                       f"provenance check and may have been built by a different "
+                       f"checkpoint or resolution. Delete it to force a clean rebuild.")
+        return True
+    with open(mpath) as h:
+        stored = json.load(h)
+    diff = {k: (stored.get(k), v) for k, v in manifest.items() if stored.get(k) != v}
+    if not diff:
+        return True
+    raise SystemExit(
+        f"stale descriptor cache: {path}\nmanifest disagrees on "
+        + ", ".join(f"{k} (cached {a!r} vs wanted {b!r})" for k, (a, b) in diff.items())
+        + "\nPass --force-rebuild to re-extract, or delete the .npy and its manifest.")
+
+
 def descriptors_for(model, traverse, cfg, args, seq, device):
     """Descriptors for one traverse, reusing ``--feature-dir`` when the cache hits."""
     path = _cache_path(args, cfg, seq)
-    if os.path.exists(path):
+    manifest = cache_manifest(args, cfg)
+    if (os.path.exists(path) and not getattr(args, "force_rebuild", False)
+            and check_cache_manifest(path, manifest)):
         desc = torch.from_numpy(np.load(path))
         logger.info(f"{seq}: loaded {tuple(desc.shape)} descriptors from {path}")
         return desc
@@ -332,6 +452,8 @@ def descriptors_for(model, traverse, cfg, args, seq, device):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     np.save(path, desc.numpy())
+    with open(path + ".manifest.json", "w") as h:
+        json.dump(manifest, h, indent=1)
     logger.info(f"{seq}: cached -> {path} ({os.path.getsize(path) / 1e6:.0f} MB)")
     return desc
 
@@ -391,17 +513,52 @@ def load_gt(gt_path, nr, nq):
     if g.shape == (nr, nq):
         return g >= 0.5, gt.shape
     rs = sk_resize(g, (nr, nq), order=1, mode="edge", anti_aliasing=False, preserve_range=True)
-    return rs >= 0.5, gt.shape
+    band = rs >= 0.5
+    # The resample is a silent reinterpretation of the ground truth, so it announces itself
+    # and proves it kept the band: a ±tolerance band's density must survive a grid change,
+    # and a large factor (band thinner than the resample stride) can thin it toward zero.
+    factor = max(gt.shape[0] / max(nr, 1), nr / max(gt.shape[0], 1),
+                 gt.shape[1] / max(nq, 1), nq / max(gt.shape[1], 1))
+    logger.warning(f"ground truth resampled {gt.shape[0]}x{gt.shape[1]} -> {nr}x{nq} "
+                   f"(max factor {factor:.2f}): density {g.mean():.4f} -> {band.mean():.4f}")
+    if g.mean() > 0 and not 0.5 <= band.mean() / g.mean() <= 2.0:
+        raise SystemExit(
+            f"the ground-truth resample changed band density by more than 2x "
+            f"({g.mean():.4f} -> {band.mean():.4f}); the descriptor grid and the GT frame "
+            f"grid disagree too much for a bilinear resample to be trusted.")
+    return band, gt.shape
+
+
+def _assert_l2_normalised(desc, name, tol=1e-3, sample=4096):
+    """A dot product is only a cosine if the rows are unit vectors — verified, not assumed.
+
+    Checks an evenly spaced sample rather than every row: a stale or foreign bank is wrong
+    everywhere, not in one row, so 4096 probes catch it while a 100k x 8448 full pass would
+    cost a visible fraction of the scoring it guards.
+    """
+    idx = torch.linspace(0, desc.size(0) - 1, min(int(sample), desc.size(0))).long()
+    norms = torch.linalg.vector_norm(desc[idx].float(), dim=1)
+    worst = float((norms - 1.0).abs().max())
+    if worst > tol:
+        raise ValueError(
+            f"{name} bank is not L2-normalised (max |norm-1| = {worst:.4f}). A dot product "
+            f"over it is not cosine similarity. If this method's descriptors are "
+            f"deliberately unnormalised (EventVLAD's are), pass allow_unnormalized=True at "
+            f"the call site; otherwise the bank is stale or was built by different code.")
 
 
 @torch.no_grad()
-def sim_matrix(ref_desc, q_desc, device, chunk=512):
+def sim_matrix(ref_desc, q_desc, device, chunk=512, allow_unnormalized=False):
     """Cosine **similarity** ``[nr, nq]`` float32 on CPU — rows = reference, columns = query.
 
     Similarity, not distance: higher means a better match, which is what
-    :func:`recall_at_k` expects. Descriptors are already L2-normalised, so the dot product
-    *is* the cosine.
+    :func:`recall_at_k` expects. Descriptors must arrive L2-normalised for the dot product
+    to *be* the cosine — asserted on a row sample unless ``allow_unnormalized`` says the
+    caller genuinely wants a plain dot product.
     """
+    if not allow_unnormalized:
+        _assert_l2_normalised(ref_desc, "reference")
+        _assert_l2_normalised(q_desc, "query")
     out = np.empty((ref_desc.size(0), q_desc.size(0)), dtype=np.float32)
     q = q_desc.to(device)
     for s in range(0, ref_desc.size(0), chunk):
@@ -541,7 +698,15 @@ def run(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    model, cfg, step = load_model(os.path.join(CKPT_DIR, f"{args.model}.pt"), device)
+    ckpt_path = os.path.join(CKPT_DIR, f"{args.model}.pt")
+    if not os.path.exists(ckpt_path):
+        # --model's argparse choices historically named checkpoints that no longer ship;
+        # fail with the actual inventory rather than a bare FileNotFoundError — and before
+        # a stale bank under the missing model's name could ever be served.
+        have = sorted(f[:-3] for f in os.listdir(CKPT_DIR) if f.endswith(".pt"))
+        raise SystemExit(f"no such checkpoint: {ckpt_path}\navailable in ckpts/: {have} "
+                         f"(pass one as --model, or a full path via --ckpt where supported)")
+    model, cfg, step = load_model(ckpt_path, device)
     logger.info(f"{args.model} (step {step}): vit={cfg.vit} agg={cfg.aggregator} "
                 f"desc={cfg.desc_dim} rep={cfg.representation} in={cfg.H}x{cfg.W}")
     logger.info(f"hot-pixel filter: {not args.no_hot_pixel}, event filter: "
@@ -557,6 +722,14 @@ def run(args):
     logger.info(f"ground truth {gt_shape[0]}x{gt_shape[1]} -> {gt.shape[0]}x{gt.shape[1]} "
                 f"[ref, query], density {gt.mean():.4f}, "
                 f"{scorable}/{gt.shape[1]} queries scorable")
+    if scorable == 0:
+        # Without this, recall_at_k divides by zero and the run reports NaN as if it were a
+        # score. A destroyed band (wrong GT file, over-aggressive resample) looks exactly
+        # like this, and it should stop the run, not annotate it.
+        raise SystemExit(
+            f"no scorable queries: the ground truth ({gt_shape[0]}x{gt_shape[1]}, resampled "
+            f"to {gt.shape[0]}x{gt.shape[1]}) has no positive for any query. The GT file "
+            f"and the descriptor grids have drifted apart.")
 
     out_dir = os.path.join(args.feature_dir, args.dataset)
     os.makedirs(out_dir, exist_ok=True)

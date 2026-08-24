@@ -8,10 +8,15 @@ absence of one) that encodes it, and the metric its descriptors live under:
 method           representation        encoder                    native metric
 ===============  ====================  =========================  ==============
 ``megaevent``    countmask [3,H,W]     DINOv2 ViT-S/14 + SALAD    cosine
+``megaloc``      countmask [3,H,W]     MegaLoc, RGB-trained       cosine
+``salad``        countmask [3,H,W]     DINOv2-SALAD, RGB-trained  cosine
+``mixvpr``       countmask [3,H,W]     ResNet50 + MixVPR, RGB     cosine
+``cricavpr``     countmask [3,H,W]     CricaVPR, RGB-trained      cosine
 ``sparse_event`` event count [H,W]     none (150-pixel readout)   L1
 ``eventvlad``    3 count sub-windows   denoiser + VGG16/NetVLAD   dot product
 ``eventgem``     MCTS [10,H,W]         SuperEvent + GeM(p=5)      cosine
 ``spikevpr``     ON/OFF count [2,H,W]  SEW-ResNet34 + MixVPR      cosine
+``lens``         ON/OFF count [2,128²] LENSv2 spiking conv net    cosine
 ===============  ====================  =========================  ==============
 
 ``similarity`` always returns *higher is better*, because that is what
@@ -26,8 +31,9 @@ spaces beyond the shared whitening every method is reported under.
 sparse_event and eventvlad are ports of Event-LAB
 (https://github.com/EventLAB-Team/Event-LAB); eventgem is Event-GeM
 (https://github.com/AdamDHines/Event-GeM); spikevpr runs the released SpikeVPR checkpoints
-out of the vendored ``SpikeVPR/`` clone. See the per-class docstrings for the paper and the
-exact source lines each one follows.
+out of the vendored ``SpikeVPR/`` clone; lens runs LENS v2
+(https://github.com/AdamDHines/LENSV2) out of its own checkout. See the per-class
+docstrings for the paper and the exact source lines each one follows.
 """
 
 import hashlib
@@ -38,14 +44,56 @@ import numpy as np
 import torch
 from loguru import logger
 from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 
 from src.inference import (
     BATCH_SIZE, CKPT_DIR, NUM_WORKERS,
     eval_transform, extract_descriptors, load_model, sim_matrix,
 )
-from src.npzdata import load_count, load_count_triplet, load_countmask, load_mcts
-from src import spikevpr_bridge
+from src import vprbench
+from src.npzdata import (load_accumulate, load_count, load_count_triplet, load_countmask,
+                         load_mcts)
 
+# npz -> frame renderers for the image-set path, keyed by the representation the
+# checkpoint was trained on (cfg.representation). The traverse path has its own dispatch
+# (src.inference._LOCAL_RENDERERS); both must cover any representation a shipped or
+# candidate checkpoint carries.
+_NPZ_RENDERERS = {"countmask": load_countmask, "accumulate": load_accumulate}
+from src import lens_bridge, spikevpr_bridge
+
+# MegaLoc (Berton & Masone 2025), loaded from its authors' torch.hub entry point
+MEGALOC_HUB = "gmberton/MegaLoc"
+MEGALOC_DESC_DIM = 8448
+MEGALOC_RESOLUTION = 322        # MegaLoc's own evaluation size, and SALAD's
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+# The countmask training statistics carried by every shipped megaevent checkpoint
+# (tencode_mean/std in ckpts/*.pt, computed by gept's --compute-stats over the I2E training
+# tree). ImageNet stats centre a countmask frame ~2 sigma off; the fairness arm re-runs an
+# RGB control under these instead, so "was the ImageNet normalisation handicapping the
+# controls" is a measurement rather than a debate. See megaloc_transform(stats=...).
+COUNTMASK_MEAN = (0.0975, 0.2804, 0.0977)
+COUNTMASK_STD = (0.1866, 0.4155, 0.1867)
+# DINOv2-SALAD (Izquierdo & Civera, CVPR 2024) — megaevent's own architecture, RGB weights
+SALAD_HUB = "serizba/salad"
+SALAD_DIRNAME = "serizba_salad_main"        # torch.hub's checkout name for SALAD_HUB
+SALAD_CKPT = "https://github.com/serizba/salad/releases/download/v1.0.0/dino_salad.ckpt"
+SALAD_ARCH = "dinov2_vitb14"
+SALAD_DESC_DIM = 64 * 128 + 256             # clusters*cluster_dim + token = 8448
+# MixVPR (Ali-bey et al., WACV 2023). The architecture is VPR-methods-evaluation's copy of
+# upstream's; the checkpoint is the authors' released 4096-d one, fetched once from their
+# Google Drive and parked beside the datasets rather than under the repo (which lives on a
+# root filesystem with ~29 GB free).
+MIXVPR_SRC = "/home/adam/repo/VPR-methods-evaluation/vpr_models/mixvpr.py"
+MIXVPR_CKPT = ("/media/adam/vprdatasets/megaevent/baseline_weights/mixvpr/"
+               "resnet50_MixVPR_4096_channels(1024)_rows(4)")
+MIXVPR_DESC_DIM = 4096          # out_channels 1024 x out_rows 4, the released configuration
+MIXVPR_RESOLUTION = 320         # MixVPRModel.forward resizes to 320x320 itself
+# CricaVPR (Lu et al., CVPR 2024)
+CRICAVPR_HUB = "Lu-Feng/CricaVPR"
+CRICAVPR_DESC_DIM = 14 * 768    # 14 region tokens x DINOv2 ViT-B width
+CRICAVPR_RESOLUTION = 224       # forced by the hardcoded 16x16 patch-grid slicing; see below
+CRICAVPR_BATCH = 16             # upstream's --infer_batch_size, and part of the method
 # sparse_event, "How Many Events Do You Need?" (Fischer & Milford, RA-L 2022)
 SPARSE_PIXELS = 150             # num_target_pixels, baselines/sparse_event.yaml
 SPARSE_RADIUS = 7               # local_suppression_radius
@@ -109,6 +157,15 @@ class MegaEventMethod:
         explicit = getattr(args, "ckpt", None)
         ckpt = explicit or os.path.join(CKPT_DIR, f"{args.model}.pt")
         self.model, self.cfg, self.step = load_model(ckpt, device)
+        # DINOv2 interpolates its position embeddings, so a checkpoint trained at 224 can be
+        # evaluated at 322 — which is what every traverse result here uses (see
+        # scripts/tokyo_trajectory.py and brisbane_pooled.py). Setting it on the image path
+        # too is what lets one number be compared against another across all six datasets.
+        resolution = getattr(args, "eval_resolution", None)
+        if resolution:
+            self.cfg.H = self.cfg.W = resolution
+        # Memory only: the bank is the same at any batch size, so this stays out of the tag.
+        self.batch_size = getattr(args, "batch_size", None) or BATCH_SIZE
         label = os.path.splitext(os.path.basename(ckpt))[0]
         checkpoint_sha256 = None
         if explicit:
@@ -119,19 +176,29 @@ class MegaEventMethod:
         logger.info(f"{label} (step {self.step}{fingerprint}): vit={self.cfg.vit} "
                     f"agg={self.cfg.aggregator} desc={self.cfg.desc_dim} "
                     f"rep={self.cfg.representation} in={self.cfg.H}x{self.cfg.W}")
-        self.tag = (f"{label}_s{self.step}_{digest}_{self.cfg.representation}" if explicit
-                    else f"{args.model}_{self.cfg.representation}")
+        # The resolution is part of the tag only when it was asked for, so the banks and
+        # results already on disk at the checkpoint's own 224 keep their names.
+        stamp = f"_r{resolution}" if resolution else ""
+        self.tag = (f"{label}_s{self.step}_{digest}_{self.cfg.representation}{stamp}" if explicit
+                    else f"{args.model}_{self.cfg.representation}{stamp}")
         self.meta = {"model": label, "step": self.step,
-                     "representation": self.cfg.representation}
+                     "representation": self.cfg.representation,
+                     "resolution": int(self.cfg.H)}
         if explicit:
             self.meta.update({"checkpoint": os.path.abspath(ckpt),
                               "checkpoint_sha256": checkpoint_sha256})
 
     def descriptors(self, paths, split):
         transform = eval_transform(self.cfg)
+        try:
+            load = _NPZ_RENDERERS[self.cfg.representation]
+        except KeyError:
+            raise ValueError(
+                f"no npz renderer for representation {self.cfg.representation!r} on the "
+                f"image-set path — add it to methods._NPZ_RENDERERS") from None
 
         def render(path):
-            frame = load_countmask(path)
+            frame = load(path)
             x = torch.from_numpy(np.ascontiguousarray(frame)).float().div_(255.0)
             return transform(x)
 
@@ -141,10 +208,456 @@ class MegaEventMethod:
                                  f"this model needs a 3-channel frame")
 
         ds = NpzFrameDataset(paths, render, check)
-        return extract_descriptors(self.model, ds, self.device, label=split)
+        return extract_descriptors(self.model, ds, self.device, label=split,
+                                   batch_size=self.batch_size)
 
     def similarity(self, ref, qry, device):
         return sim_matrix(ref, qry, device)          # descriptors are L2-normalised
+
+
+# ---------------------------------------------------------------------------
+# 1b. megaloc — the RGB state of the art, unretrained, on the same frames
+# ---------------------------------------------------------------------------
+def megaloc_transform(resolution, stats="imagenet"):
+    """countmask ``[3,H,W]`` already scaled to [0,1] -> the tensor MegaLoc expects.
+
+    ImageNet statistics, then resize — the constants and the order
+    ``VPR-methods-evaluation``'s own event path uses, so a bank built here reproduces one
+    built there. The resize is bilinear+antialias rather than megaevent's bicubic for the
+    same reason: each model keeps the preprocessing its own harness ships with, and the
+    interpolation kernel is not what this comparison is about.
+
+    ``stats="countmask"`` swaps in the event-training statistics megaevent itself uses —
+    the fairness arm: banks built under it must carry a distinct tag, never the default one.
+    """
+    mean, std = ((COUNTMASK_MEAN, COUNTMASK_STD) if stats == "countmask"
+                 else (IMAGENET_MEAN, IMAGENET_STD))
+    return transforms.Compose([
+        transforms.Normalize(mean, std),
+        transforms.Resize((resolution, resolution), antialias=True),
+    ])
+
+
+class MegaLocMethod:
+    """MegaLoc on countmask frames: an RGB-trained retrieval model, not retrained.
+
+    "MegaLoc: One Retrieval to Place Them All" (Berton & Masone, CVPR workshops 2025),
+    loaded unmodified from the authors' ``torch.hub`` entry point. It is the only method
+    here that has never seen an event: it was trained on street-view, aerial and indoor
+    *photographs*, and the frames it is given are the same countmask renders megaevent is
+    given, at the same size and under the same ground truth.
+
+    That makes it the control this benchmark otherwise lacks. Every other baseline is an
+    event method, so a win over them says megaevent is the better event method; it does
+    not say that training on events was worth doing at all. A countmask frame is still an
+    image — edges on a black background — and a large RGB model may simply read it. What
+    MegaLoc scores here is therefore the floor that fine-tuning has to clear.
+
+    Two things to keep in front of any comparison against it. It is **228.6M parameters
+    against megaevent ViT-B's 88.0M** — not on the backbone, which is the same DINOv2 ViT-B
+    at 86.6M in both, but entirely in the head: SALAD widened to cluster_dim 256 and then
+    compressed by a 140.6M-parameter ``Linear(16640 -> 8448)``. For the comparison that
+    holds capacity fixed see :class:`SaladMethod`, which is megaevent's architecture exactly.
+    And the datasets differ in how much of a photograph survives in their events: Tokyo
+    24/7, Pitts250k and MSLS are I2E simulations of RGB frames, where Brisbane-Event, NSAVP
+    and NYC-Event are real DAVIS/Prophesee recordings.
+    """
+
+    name = "megaloc"
+    native_metric = "cosine"
+    multi_seed = False
+
+    def __init__(self, args, device):
+        self.device = device
+        self.resolution = getattr(args, "eval_resolution", None) or MEGALOC_RESOLUTION
+        # a memory knob only for these three: descriptors do not depend on the
+        # batch, unlike cricavpr. Honours --batch-size so a shared card can be
+        # survived without changing the numbers.
+        self.batch_size = getattr(args, "batch_size", None) or BATCH_SIZE
+        # trust_repo: the checkout is already in the hub cache, and a prompt would hang a
+        # backgrounded run. source="github" keeps it resolving the same way upstream does.
+        model = torch.hub.load(MEGALOC_HUB, "get_trained_model", source="github",
+                               trust_repo=True)
+        self.model = model.eval().to(device)
+        params = sum(p.numel() for p in self.model.parameters())
+        # countmask unless the caller asks otherwise; the tag carries it so the
+        # accumulate banks never collide with the published countmask ones.
+        self.representation = getattr(args, "representation", None) or "countmask"
+        self.tag = f"megaloc_{self.representation}_r{self.resolution}"
+        self.meta = {"model": "megaloc", "hub": MEGALOC_HUB, "representation": self.representation,
+                     "resolution": self.resolution, "descriptor_dim": MEGALOC_DESC_DIM,
+                     "parameters": int(params), "trained_on": "RGB images, no event data"}
+        logger.info(f"MegaLoc (torch.hub {MEGALOC_HUB}, {params / 1e6:.1f}M params): "
+                    f"desc={MEGALOC_DESC_DIM} rep={self.representation} "
+                    f"in={self.resolution}x{self.resolution}")
+
+    def descriptors(self, paths, split):
+        transform = megaloc_transform(self.resolution)
+
+        load = _NPZ_RENDERERS[self.representation]
+
+        def render(path):
+            frame = load(path)
+            x = torch.from_numpy(np.ascontiguousarray(frame)).float().div_(255.0)
+            return transform(x)
+
+        def check(path, frame):
+            if frame.ndim != 3 or frame.shape[0] != 3:
+                raise ValueError(f"{path} renders {tuple(frame.shape)}; "
+                                 f"this model needs a 3-channel frame")
+
+        ds = NpzFrameDataset(paths, render, check)
+        return extract_descriptors(self.model, ds, self.device, label=split,
+                                   batch_size=self.batch_size, oom_backoff=True)
+
+    def similarity(self, ref, qry, device):
+        return sim_matrix(ref, qry, device)          # MegaLoc L2-normalises its output
+
+
+# ---------------------------------------------------------------------------
+# 1c. salad — megaevent's own architecture, RGB-trained
+# ---------------------------------------------------------------------------
+def build_dino_salad(arch=SALAD_ARCH):
+    """The released DINOv2-SALAD, built without pytorch_lightning.
+
+    ``serizba/salad``'s hubconf routes through ``vpr_model.VPRModel``, a LightningModule
+    whose ``__init__`` calls ``save_hyperparameters()`` and builds a loss and a miner —
+    pytorch_lightning plus pytorch_metric_learning, neither in this environment and neither
+    needed for a forward pass. The backbone and the aggregator are plain ``nn.Module``s and
+    the released checkpoint is a raw state_dict keyed ``backbone.*`` / ``aggregator.*``, so
+    a two-attribute wrapper takes it ``strict=True``. Everything that computes is upstream's.
+    """
+    salad_dir = os.path.join(torch.hub.get_dir(), SALAD_DIRNAME)
+    if not os.path.isdir(salad_dir):
+        raise FileNotFoundError(
+            f"{salad_dir} not found. Fetch the checkout once with "
+            f"torch.hub.load('{SALAD_HUB}', 'dinov2_salad') on a machine with network "
+            f"access, or clone {SALAD_HUB} there.")
+    if salad_dir not in sys.path:
+        sys.path.insert(0, salad_dir)
+    from models.aggregators.salad import SALAD
+    from models.backbones.dinov2 import DINOv2, DINOV2_ARCHS
+
+    class DinoSalad(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # hubconf's own defaults. num_trainable_blocks only gates gradients, which
+            # never flow here, but it is kept so the module tree matches the checkpoint.
+            self.backbone = DINOv2(model_name=arch, num_trainable_blocks=4,
+                                   return_token=True, norm_layer=True)
+            self.aggregator = SALAD(num_channels=DINOV2_ARCHS[arch], num_clusters=64,
+                                    cluster_dim=128, token_dim=256)
+
+        def forward(self, x):
+            return self.aggregator(self.backbone(x))
+
+    model = DinoSalad()
+    state = torch.hub.load_state_dict_from_url(SALAD_CKPT, map_location="cpu")
+    model.load_state_dict(state.get("state_dict", state), strict=True)
+    return model
+
+
+class SaladMethod:
+    """DINOv2-SALAD on countmask frames: *megaevent's architecture*, RGB weights.
+
+    "Optimal Transport Aggregation for Visual Place Recognition" (Izquierdo & Civera,
+    CVPR 2024), the released GSV-Cities checkpoint, run unmodified on the same countmask
+    frames under the same ground truth.
+
+    This is the control MegaLoc cannot be. megaevent ViT-B *is* this model — DINOv2 ViT-B/14,
+    SALAD with 64 clusters x 128 + a 256-d token, an 8448-d descriptor, evaluated at 322 —
+    down to 88.0M parameters against SALAD's 87,991,489. Two things differ, and only two:
+    the backbone's starting point (GEPT's event pretraining, not raw DINOv2) and what the
+    weights were then trained on (I2E events, not GSV-Cities photographs). So the gap to
+    this column is what the event fine-tuning bought, with architecture, capacity,
+    descriptor width and input geometry all held fixed.
+
+    MegaLoc answers a different question and both are needed. It is 228.6M parameters —
+    the same ViT-B backbone, then SALAD widened to cluster_dim 256 and learnedly compressed
+    by a 140.6M-parameter ``Linear(16640 -> 8448)`` — trained on street-view, aerial and
+    indoor imagery far beyond GSV-Cities. Beating SALAD says the fine-tuning worked;
+    beating MegaLoc says the result stands against the best available RGB model. A gap that
+    opens against MegaLoc but not against SALAD is a statement about head capacity and
+    training scale, not about events.
+    """
+
+    name = "salad"
+    native_metric = "cosine"
+    multi_seed = False
+
+    def __init__(self, args, device):
+        self.device = device
+        self.resolution = getattr(args, "eval_resolution", None) or MEGALOC_RESOLUTION
+        # a memory knob only for these three: descriptors do not depend on the
+        # batch, unlike cricavpr. Honours --batch-size so a shared card can be
+        # survived without changing the numbers.
+        self.batch_size = getattr(args, "batch_size", None) or BATCH_SIZE
+        self.model = build_dino_salad().eval().to(device)
+        params = sum(p.numel() for p in self.model.parameters())
+        # countmask unless the caller asks otherwise; the tag carries it so the
+        # accumulate banks never collide with the published countmask ones.
+        self.representation = getattr(args, "representation", None) or "countmask"
+        self.tag = f"salad_{self.representation}_r{self.resolution}"
+        self.meta = {"model": "salad", "hub": SALAD_HUB, "representation": self.representation,
+                     "resolution": self.resolution, "descriptor_dim": SALAD_DESC_DIM,
+                     "parameters": int(params), "trained_on": "GSV-Cities RGB, no event data"}
+        logger.info(f"DINOv2-SALAD ({SALAD_HUB}, {params / 1e6:.1f}M params): "
+                    f"desc={SALAD_DESC_DIM} rep={self.representation} "
+                    f"in={self.resolution}x{self.resolution}")
+
+    def descriptors(self, paths, split):
+        # SALAD ships the same ImageNet normalisation and 322 square resize MegaLoc does
+        # (dataloaders/GSVCitiesDataset.py, eval.py's --image_size 322), so the two RGB
+        # controls see byte-identical inputs and differ only in the network.
+        transform = megaloc_transform(self.resolution)
+
+        load = _NPZ_RENDERERS[self.representation]
+
+        def render(path):
+            frame = load(path)
+            x = torch.from_numpy(np.ascontiguousarray(frame)).float().div_(255.0)
+            return transform(x)
+
+        def check(path, frame):
+            if frame.ndim != 3 or frame.shape[0] != 3:
+                raise ValueError(f"{path} renders {tuple(frame.shape)}; "
+                                 f"this model needs a 3-channel frame")
+
+        ds = NpzFrameDataset(paths, render, check)
+        return extract_descriptors(self.model, ds, self.device, label=split,
+                                   batch_size=self.batch_size, oom_backoff=True)
+
+    def similarity(self, ref, qry, device):
+        return sim_matrix(ref, qry, device)          # SALAD's last op is an L2 normalise
+
+
+# ---------------------------------------------------------------------------
+# 1d. mixvpr — a CNN RGB baseline, no transformer anywhere
+# ---------------------------------------------------------------------------
+def build_mixvpr(desc_dim=MIXVPR_DESC_DIM, ckpt=MIXVPR_CKPT):
+    """The released 4096-d MixVPR, built from VPR-methods-evaluation's copy of upstream.
+
+    Loaded by *file path* rather than as ``from vpr_models import mixvpr``:
+    ``vpr_models/__init__.py`` eagerly imports apgem, boq, qaa, supervlad and friends, none
+    of which are installed here, so the package import fails before reaching the one module
+    that is needed. ``mixvpr.py`` itself only wants torch, torchvision and gdown.
+
+    Upstream's ``get_mixvpr`` downloads the checkpoint to a **CWD-relative**
+    ``trained_models/mixvpr/``, which would put 44 MB somewhere different for every caller
+    and needs gdown (absent from this environment). The architecture is taken from that
+    module and the state_dict is loaded here from a fixed path instead. Everything that
+    computes is upstream's.
+    """
+    import importlib.util
+    import types
+
+    spec = importlib.util.spec_from_file_location("_vpr_mixvpr", MIXVPR_SRC)
+    module = importlib.util.module_from_spec(spec)
+    # `import gdown` sits at the top of that file purely for get_mixvpr's downloader, and
+    # gdown is not in this environment. Standing in a module whose only attribute raises
+    # keeps the import working while making any *actual* download attempt loud rather than
+    # silent — the checkpoint has to come from MIXVPR_CKPT.
+    if "gdown" not in sys.modules:
+        stub = types.ModuleType("gdown")
+
+        def _no_download(*args, **kwargs):
+            raise RuntimeError(
+                f"gdown is not installed here; MixVPR's checkpoint must already be at "
+                f"{MIXVPR_CKPT}")
+
+        stub.download = _no_download
+        sys.modules["gdown"] = stub
+    spec.loader.exec_module(module)
+
+    url, filename, out_channels, out_rows = module.MODELS_INFO[desc_dim]
+    if not os.path.exists(ckpt):
+        raise FileNotFoundError(
+            f"{ckpt} not found. Fetch it once with "
+            f"`gdown {url.split('/d/')[1].split('/')[0]} -O '{filename}'`.")
+    # upstream's get_mixvpr() config, verbatim
+    model = module.MixVPRModel(agg_config={
+        "in_channels": 1024, "in_h": 20, "in_w": 20, "out_channels": out_channels,
+        "mix_depth": 4, "mlp_ratio": 1, "out_rows": out_rows,
+    })
+    model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+    return model
+
+
+class MixVPRMethod:
+    """MixVPR on countmask frames: the CNN RGB baseline, never retrained on events.
+
+    "MixVPR: Feature Mixing for Visual Place Recognition" (Ali-bey, Chaib-draa & Giguère,
+    WACV 2023), the authors' released 4096-d GSV-Cities checkpoint, run unmodified on the
+    same countmask frames under the same ground truth as every other column.
+
+    It is the only RGB control here with no transformer in it: a ResNet50 truncated after
+    ``layer3`` (``layer4`` and the fc are ``nn.Identity``) feeding a stack of four
+    feature-mixer MLPs, 10.9M parameters against SALAD's 88.0M and MegaLoc's 228.6M. So it
+    reads the third capacity point, and reads it with a fundamentally different inductive
+    bias — where :class:`SaladMethod` and :class:`MegaLocMethod` both sit on DINOv2 ViT-B/14
+    and therefore share whatever a patch-token backbone does or does not see in a countmask
+    frame, MixVPR shares none of that.
+
+    Geometry is upstream's, not this benchmark's 322: ``MixVPRModel.forward`` begins with
+    ``Resize([320, 320])`` because the aggregator's ``in_h``/``in_w`` are fixed at 20, which
+    is 320/16 after the ResNet's stride. Passing 322 would silently be resized to 320
+    anyway, so 320 is passed explicitly and recorded. Normalisation is ImageNet, shared with
+    the other two RGB controls.
+    """
+
+    name = "mixvpr"
+    native_metric = "cosine"
+    multi_seed = False
+
+    def __init__(self, args, device):
+        self.device = device
+        # Not `args.eval_resolution`: 320 is structural here, not a tuning choice.
+        self.resolution = MIXVPR_RESOLUTION
+        self.batch_size = getattr(args, "batch_size", None) or BATCH_SIZE
+        self.model = build_mixvpr().eval().to(device)
+        params = sum(p.numel() for p in self.model.parameters())
+        # countmask unless the caller asks otherwise; the tag carries it so the
+        # accumulate banks never collide with the published countmask ones.
+        self.representation = getattr(args, "representation", None) or "countmask"
+        self.tag = f"mixvpr_{self.representation}_r{self.resolution}"
+        self.meta = {"model": "mixvpr", "hub": MIXVPR_SRC, "representation": self.representation,
+                     "resolution": self.resolution, "descriptor_dim": MIXVPR_DESC_DIM,
+                     "parameters": int(params), "checkpoint": MIXVPR_CKPT,
+                     "trained_on": "GSV-Cities RGB, no event data"}
+        logger.info(f"MixVPR ({os.path.basename(MIXVPR_CKPT)}, {params / 1e6:.1f}M params): "
+                    f"desc={MIXVPR_DESC_DIM} rep={self.representation} "
+                    f"in={self.resolution}x{self.resolution}")
+
+    def descriptors(self, paths, split):
+        transform = megaloc_transform(self.resolution)
+
+        load = _NPZ_RENDERERS[self.representation]
+
+        def render(path):
+            frame = load(path)
+            x = torch.from_numpy(np.ascontiguousarray(frame)).float().div_(255.0)
+            return transform(x)
+
+        def check(path, frame):
+            if frame.ndim != 3 or frame.shape[0] != 3:
+                raise ValueError(f"{path} renders {tuple(frame.shape)}; "
+                                 f"this model needs a 3-channel frame")
+
+        ds = NpzFrameDataset(paths, render, check)
+        return extract_descriptors(self.model, ds, self.device, label=split,
+                                   batch_size=self.batch_size, oom_backoff=True)
+
+    def similarity(self, ref, qry, device):
+        return sim_matrix(ref, qry, device)          # MixVPR's aggregator ends in F.normalize
+
+
+# ---------------------------------------------------------------------------
+# 1e. cricavpr — the RGB control whose descriptors depend on the batch
+# ---------------------------------------------------------------------------
+def build_cricavpr(hub=CRICAVPR_HUB):
+    """The released CricaVPR, unwrapped from the ``DataParallel`` its hubconf returns.
+
+    ``hubconf.trained_model()`` wraps ``CricaVPRNet`` in ``torch.nn.DataParallel`` because
+    that is how the checkpoint's keys are named. On one GPU the wrapper is a no-op that
+    still costs a scatter/gather, and — more to the point — DataParallel splits along dim 0,
+    which for this network is the *cross-image attention sequence* (see
+    :class:`CricaVPRMethod`). Unwrapping to ``.module`` keeps a multi-GPU box from silently
+    changing what the method computes.
+    """
+    model = torch.hub.load(hub, "trained_model", source="github", trust_repo=True)
+    return getattr(model, "module", model)
+
+
+class CricaVPRMethod:
+    """CricaVPR on countmask frames: an RGB baseline whose descriptors are batch-dependent.
+
+    "CricaVPR: Cross-image Correlation-aware Representation Learning for Visual Place
+    Recognition" (Lu, Lan, Zhang, Dong, Wang & Yuan, CVPR 2024), the authors' released
+    checkpoint, run unmodified on the same countmask frames under the same ground truth.
+    DINOv2 ViT-B/14 backbone, 14 multi-scale GeM region tokens (1 class + a 2x2 grid + a 3x3
+    grid), a 2-layer transformer encoder over them, 10752-d.
+
+    **Two things about it are configuration, not detail.**
+
+    *The input must be exactly 224x224.* ``network.py:57-64`` derives the patch grid as
+    ``W = H = int(sqrt(P - 1))`` and then slices fixed regions out of it — ``[0:8, 0:8]``,
+    ``[5:11, 5:11]``, ``[11:, 11:]`` and so on. Those indices only partition a 16x16 grid,
+    which is 224/14. At this benchmark's usual 322 the grid is 23x23 and the "3x3" regions
+    would silently cover 11 of 23 rows twice and the last 12 not at all. So CricaVPR keeps
+    its own published geometry, exactly as Event-GeM keeps its 240x320 — what is held fixed
+    across the table is the event stream, the countmask render and the ground truth, not the
+    resize each published method specifies.
+
+    *Descriptors depend on which other images shared the batch.* The encoder is built with
+    ``batch_first=False``, i.e. it reads ``(seq, batch, feature)``, and is then handed a
+    ``(B, 14, D)`` tensor — so the attention sequence is **B**, the images. Upstream says so
+    in as many words at ``network.py:48-49``: *"Our input tensor is provided as (batch, seq,
+    feature), which performs encoding on the 'batch' dimension."* That is the "cross-image"
+    in the name and it is the whole method, but it means a descriptor is not a function of
+    its image alone.
+
+    Measured here rather than assumed, on one image encoded three ways: against 15
+    neighbours vs alone, cosine **0.9905**; against 15 neighbours vs 14 *different*
+    neighbours, cosine **0.99998**. So it is the batch *size* that moves a descriptor, and
+    which particular frames fill the batch barely does. Consequences:
+
+    * the batch size is pinned to upstream's ``--infer_batch_size`` default of 16, for every
+      split and both the image-set and pooled paths, and recorded in ``meta``. Changing it
+      changes the numbers, so it is not a memory knob here;
+    * the file order fixes the batching, and every path list in this repo is a sorted
+      listing or a slice index, so a rerun reproduces a run exactly;
+    * ``drop_last=False`` leaves one short final batch per split. Those frames see fewer
+      neighbours and shift by roughly the 0.99 cosine above — at most 15 frames of ~450k,
+      and it is upstream's behaviour too.
+    """
+
+    name = "cricavpr"
+    native_metric = "cosine"
+    multi_seed = False
+
+    def __init__(self, args, device):
+        self.device = device
+        # Not `args.eval_resolution` — 224 is structural, see the class docstring.
+        self.resolution = CRICAVPR_RESOLUTION
+        self.batch_size = CRICAVPR_BATCH
+        self.model = build_cricavpr().eval().to(device)
+        params = sum(p.numel() for p in self.model.parameters())
+        # countmask unless the caller asks otherwise; the tag carries it so the
+        # accumulate banks never collide with the published countmask ones.
+        self.representation = getattr(args, "representation", None) or "countmask"
+        self.tag = f"cricavpr_{self.representation}_r{self.resolution}"
+        self.meta = {"model": "cricavpr", "hub": CRICAVPR_HUB, "representation": self.representation,
+                     "resolution": self.resolution, "descriptor_dim": CRICAVPR_DESC_DIM,
+                     "parameters": int(params), "batch_size": self.batch_size,
+                     "cross_image_batch": True,
+                     "trained_on": "GSV-Cities RGB, no event data"}
+        logger.info(f"CricaVPR (torch.hub {CRICAVPR_HUB}, {params / 1e6:.1f}M params): "
+                    f"desc={CRICAVPR_DESC_DIM} rep={self.representation} "
+                    f"in={self.resolution}x{self.resolution} batch={self.batch_size} "
+                    f"(cross-image attention runs over the batch)")
+
+    def descriptors(self, paths, split):
+        transform = megaloc_transform(self.resolution)
+
+        load = _NPZ_RENDERERS[self.representation]
+
+        def render(path):
+            frame = load(path)
+            x = torch.from_numpy(np.ascontiguousarray(frame)).float().div_(255.0)
+            return transform(x)
+
+        def check(path, frame):
+            if frame.ndim != 3 or frame.shape[0] != 3:
+                raise ValueError(f"{path} renders {tuple(frame.shape)}; "
+                                 f"this model needs a 3-channel frame")
+
+        ds = NpzFrameDataset(paths, render, check)
+        # batch_size is part of the method here, not a memory knob — see the class docstring.
+        return extract_descriptors(self.model, ds, self.device, label=split,
+                                   batch_size=self.batch_size)
+
+    def similarity(self, ref, qry, device):
+        return sim_matrix(ref, qry, device)          # forward() ends in F.normalize
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +928,9 @@ class EventVLADMethod:
         Rank-identical to Event-LAB's ``D = (1 - q @ r.T).T`` (``eventvlad.py:208``),
         just kept in the higher-is-better convention the metric expects.
         """
-        return sim_matrix(ref, qry, device)         # a plain dot product; see docstring
+        # allow_unnormalized: EventVLAD's descriptors are deliberately not unit vectors,
+        # so this is the one similarity here that is a dot product rather than a cosine.
+        return sim_matrix(ref, qry, device, allow_unnormalized=True)
 
 
 # ---------------------------------------------------------------------------
@@ -624,15 +1139,220 @@ class SpikeVPRMethod:
         return sim_matrix(ref, qry, device)          # the MixVPR head L2-normalises
 
 
+class LensMethod:
+    """LENS v2: a 111,694-parameter spiking conv net for a Speck2f, cosine.
+
+    "LENS: Locational Encoding with Neuromorphic Systems" (Hines, Milford & Fischer,
+    Science Robotics 2025) in its v2 form — a descriptor network rather than v1's one-hot
+    place classifier. Six conv layers, 454 KiB of weights, and a 1024-D descriptor that is
+    literally the spike count of a 16x8x8 output layer. It is two to four orders of
+    magnitude smaller than everything else in this table, and the comparison is worth
+    reading with that in front of it: megaevent's ViT-B is ~86M parameters at 322x322,
+    LENS is 0.11M at 128x128.
+
+    Three things about its input, all of which are model contract rather than preference.
+
+    **Raw counts, polarity never merged.** The frame is ``(2, 128, 128)`` ON/OFF counts and
+    the first spiking layer is an IAF firing on their absolute magnitude, so the event
+    *rate* is part of the contract exactly as it is for SpikeVPR. Unlike SpikeVPR, LENS
+    trains on I2E output: ~48 events/px on its own 128x128 grid. Tokyo 24/7 renders 37-45
+    there and is therefore **in distribution**, where for SpikeVPR it is ~43x out of it.
+    Brisbane is LENS's out-of-distribution end at 3.3 — 15x sparser than training.
+
+    **The rebin is LENS's own.** Reaching 128 through :func:`src.npzdata.load_onoff`'s
+    (260, 346) would resample twice and rescale every bin, moving the IAF operating point.
+    So this is the one method that does not share ``src/npzdata.py``; see
+    :mod:`src.lens_bridge`.
+
+    **int8 is not a tax.** ``--lens-quantise chip`` runs the discretised
+    ``DynapcnnNetwork`` that actually deploys, and on Brisbane it *beats* the fp32 weights
+    (sunset1 R@1 60.8 -> 67.1) while nearly doubling descriptor spike count. The two are
+    different models; whichever produced a bank is recorded in the tag and in ``meta``.
+
+    The forward pass runs in LENS's own pixi environment rather than here, because it needs
+    sinabs to build the chip network at all; see :mod:`src.lens_bridge` for the seam.
+    """
+
+    name = "lens"
+    native_metric = "cosine"
+    multi_seed = False
+
+    def __init__(self, args, device):
+        self.device = device
+        model = args.lens_model
+        self.repo = args.lens_repo
+        checkpoint = lens_bridge.resolve_checkpoint(model, self.repo)
+        digest = lens_bridge.checkpoint_sha256(checkpoint)
+        provenance = lens_bridge.describe(checkpoint)
+
+        self.checkpoint = checkpoint
+        self.quantise = args.lens_quantise
+        self.batch_size = args.lens_batch_size
+        self.out_dir = os.path.join(args.feature_dir, args.dataset)
+        self.suffix = f"_limit{args.limit}" if getattr(args, "limit", None) else ""
+
+        # The tag has to separate every input that changes a descriptor, because
+        # src.scoring's cache is keyed on it: the checkpoint bytes, fp32-vs-int8 (different
+        # models), and the batch size (sinabs makes the batch dimension visible, so 64 and
+        # 128 are not the same network).
+        label = os.path.splitext(os.path.basename(checkpoint))[0]
+        self.tag = f"lens_{label}_{digest[:10]}_{self.quantise}_b{self.batch_size}"
+        # 16 readout channels -> 1024-D, 64 -> 4096-D; both deploy on the same seven cores.
+        self.descriptor_dim = int(provenance.get("descriptor_channels") or 16) * 8 * 8
+        self.meta = {"checkpoint": checkpoint, "checkpoint_sha256": digest,
+                     "quantise": self.quantise, "batch_size": self.batch_size,
+                     "descriptor_dim": self.descriptor_dim,
+                     "grid": list(lens_bridge.INPUT_SHAPE[1:]),
+                     "parameters": 111694, **provenance}
+        logger.info(f"LENS v2 {label} (sha256 {digest[:10]}, step {provenance['step']}, "
+                    f"ann={provenance['ann']}, "
+                    f"spike_threshold={provenance['spike_threshold']}): "
+                    f"{lens_bridge.DESC_DIM}-d {self.quantise}, "
+                    f"in={lens_bridge.INPUT_SHAPE[1]}x{lens_bridge.INPUT_SHAPE[2]}, "
+                    f"batch {self.batch_size}")
+
+    def descriptors(self, paths, split):
+        out = os.path.join(self.out_dir, f"{self.tag}_{split}{self.suffix}_bank.npy")
+        job = lens_bridge.npz_job(
+            paths, checkpoint=self.checkpoint, out=out, quantise=self.quantise,
+            batch_size=self.batch_size, workers=lens_bridge.WORKERS,
+            lens_repo=self.repo, label=split, descriptor_dim=self.descriptor_dim)
+        return torch.from_numpy(lens_bridge.run(job, self.repo))
+
+    def similarity(self, ref, qry, device):
+        return sim_matrix(ref, qry, device)          # descriptor() L2-normalises
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 1f. boq / qaa / supervlad — further RGB controls, borrowed from VPR-methods-evaluation
+# ---------------------------------------------------------------------------
+class _VPRBenchMethod:
+    """Shared body for the controls whose networks live in VPR-methods-evaluation.
+
+    MegaLoc, SALAD, MixVPR and CricaVPR each get their own class because each carries a
+    different structural constraint (CricaVPR's batch, MixVPR's 320). These three do not:
+    all are DINOv2 backbones evaluated at 322 under ImageNet normalisation, producing an
+    already-L2-normalised descriptor, so they differ only in a builder, a width and a name.
+    One base with three thin subclasses says that, where three copies would not.
+
+    The networks themselves are loaded out of the VPR-methods-evaluation checkout — see
+    :mod:`src.vprbench` for why by path rather than by importing ``vpr_models``.
+    """
+
+    native_metric = "cosine"
+    multi_seed = False
+    desc_dim = None
+    resolution = None
+    source = None
+
+    def _build(self):
+        raise NotImplementedError
+
+    def __init__(self, args, device):
+        self.device = device
+        self.model = self._build().eval().to(device)
+        params = sum(p.numel() for p in self.model.parameters())
+        self.batch_size = getattr(args, "batch_size", None) or BATCH_SIZE
+        self.representation = getattr(args, "representation", None) or "countmask"
+        self.tag = f"{self.name}_{self.representation}_r{self.resolution}"
+        self.meta = {"model": self.name, "hub": self.source,
+                     "representation": self.representation,
+                     "resolution": self.resolution, "descriptor_dim": self.desc_dim,
+                     "parameters": int(params),
+                     "trained_on": "GSV-Cities RGB, no event data"}
+        logger.info(f"{self.name} ({self.source}, {params / 1e6:.1f}M params): "
+                    f"desc={self.desc_dim} rep={self.representation} "
+                    f"in={self.resolution}x{self.resolution}")
+
+    def descriptors(self, paths, split):
+        transform = megaloc_transform(self.resolution)
+        load = _NPZ_RENDERERS[self.representation]
+
+        def render(path):
+            frame = load(path)
+            x = torch.from_numpy(np.ascontiguousarray(frame)).float().div_(255.0)
+            return transform(x)
+
+        def check(path, frame):
+            if frame.ndim != 3 or frame.shape[0] != 3:
+                raise ValueError(f"{path} renders {tuple(frame.shape)}; "
+                                 f"this model needs a 3-channel frame")
+
+        ds = NpzFrameDataset(paths, render, check)
+        return extract_descriptors(self.model, ds, self.device, label=split,
+                                   batch_size=self.batch_size, oom_backoff=True)
+
+    def similarity(self, ref, qry, device):
+        return sim_matrix(ref, qry, device)          # all three end in an L2 normalise
+
+
+class BoQMethod(_VPRBenchMethod):
+    """BoQ on DINOv2 ViT-B — learnable "bag of queries" cross-attention, 12288-d at 322.
+
+    The strongest RGB control here after MegaLoc, and a different aggregation family from
+    every other column: instead of pooling patch tokens (SALAD's optimal transport, CricaVPR's
+    GeM regions, MixVPR's feature mixing) it cross-attends a fixed set of 64 learned queries
+    against them. BoQ also ships a ResNet50 variant at the same aggregator, so if the CNN /
+    ViT split on these frames is a backbone story rather than a method story, that pair is
+    what would show it.
+    """
+
+    name = "boq"
+    desc_dim = vprbench.BOQ_DESC_DIM
+    resolution = vprbench.BOQ_RESOLUTION
+    source = vprbench.BOQ_SRC
+
+    def _build(self):
+        return vprbench.build_boq()
+
+
+class QAAMethod(_VPRBenchMethod):
+    """QAA on DINOv2 — 8192-d at 322, the most recent method in the comparison set."""
+
+    name = "qaa"
+    desc_dim = vprbench.QAA_DESC_DIM
+    resolution = vprbench.QAA_RESOLUTION
+    source = vprbench.QAA_SRC
+
+    def _build(self):
+        return vprbench.build_qaa(self.desc_dim)
+
+
+class SuperVLADMethod(_VPRBenchMethod):
+    """SuperVLAD on DINOv2 ViT-B — 3072-d at 322.
+
+    The compact point of the ViT ladder: a tenth of MegaLoc's width and a quarter of BoQ's,
+    which is what makes it worth reading beside them on frames none of the three trained on.
+    This is the plain arm, not ``SuperVLAD-CrossImage`` — the latter's encoder attends across
+    the batch the way CricaVPR's does, so it could not share this class's OOM backoff.
+    """
+
+    name = "supervlad"
+    desc_dim = vprbench.SUPERVLAD_DESC_DIM
+    resolution = vprbench.SUPERVLAD_RESOLUTION
+    source = vprbench.SUPERVLAD_SRC
+
+    def _build(self):
+        return vprbench.build_supervlad("SuperVLAD")
+
+
 METHODS = {
     "megaevent": MegaEventMethod,
+    "megaloc": MegaLocMethod,
+    "salad": SaladMethod,
+    "mixvpr": MixVPRMethod,
+    "cricavpr": CricaVPRMethod,
+    "boq": BoQMethod,
+    "qaa": QAAMethod,
+    "supervlad": SuperVLADMethod,
     "sparse_event": SparseEventMethod,
     "eventvlad": EventVLADMethod,
     "eventgem": EventGeMMethod,
     "spikevpr": SpikeVPRMethod,
+    "lens": LensMethod,
 }
 
 

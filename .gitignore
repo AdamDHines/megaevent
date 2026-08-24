@@ -223,8 +223,11 @@ __marimo__/
 # project files
 *.pt
 features/
+# scripts/topk_figures.py writes hundreds of PNGs here for the paper's qualitative panels
+output/
 # Event-GeM is vendored as a plain clone until it is promoted to a submodule
 external/eventgem/
 SpikeVPR/
 pittsinfo/
 envs/
+trained_models/

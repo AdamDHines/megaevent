@@ -142,13 +142,19 @@ def assert_filter_active(args, traverse, filter_dt_us, n_probe=12):
 
     identity = transforms.Compose([])
     sensor, path = inf.sensor_size(args.dataset), inf.sequence_path(args, traverse)
+    # "Active" = deviates from the representation's background — 0 for the black-bg reps
+    # (where this reduces to the original nonzero test) but 1.0 for accumulate, whose
+    # WHITE background made the nonzero test count every pixel active and read a working
+    # filter as "100% retention, filter off" (killed the first v8 benchmark pass).
+    bg = 1.0 if args.representation == "accumulate" else 0.0
     frac = {}
     for label, dt_us in (("off", None), ("on", filter_dt_us)):
         ds = inf.EventStreamDataset(args.dataset, traverse, path, identity,
                                     args.representation, args.dt_ms, sensor,
                                     hot_pixel=not args.no_hot_pixel, filter_dt_us=dt_us)
         idx = np.linspace(500, len(ds) - 500, n_probe).astype(int)
-        frac[label] = np.array([float((ds[i].numpy() != 0).mean()) for i in idx])
+        frac[label] = np.array([float((np.abs(ds[i].numpy() - bg) > 1e-6).mean())
+                                for i in idx])
     retention = float((frac["on"] / frac["off"]).mean())
     if not 0.50 <= retention <= 0.95:
         raise SystemExit(
@@ -187,7 +193,8 @@ def traverse_geometry(args, sequences, npz_root, aps_align=False):
             print(f"    {seq:9s} APS alignment drops {dropped} of {int(covered.sum())} "
                   f"GPS-covered frames ({dropped / max(int(covered.sum()), 1):.1%})")
         print(f"    {seq:9s} {info['n_frames']:6d} frames  {info['n_gps_fixes']:4d} GPS fixes  "
-              f"{info['uncovered']:4d} outside GPS span  route {info['route_len_m']:.0f} m"
+              f"{info['uncovered']:4d} outside GPS span  route {info['route_len_m']:.0f} m  "
+              f"clock {info['clock_offset_s']:+.2f} s"
               + ("  [slice_times verified]" if info["slice_times_checked"] else ""))
     lengths = [g[3]["route_len_m"] for g in geom.values()]
     spread = (max(lengths) - min(lengths)) / float(np.mean(lengths))

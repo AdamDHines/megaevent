@@ -100,6 +100,60 @@ def load_countmask(path):
     return _stream(x, y, t, p, height, width).countmask(white_frame=False).numpy()
 
 
+def load_accumulate(path):
+    """One ``.npz`` -> ``[3, H, W]`` uint8 GEPT-native ``accumulate`` frame.
+
+    The white-background counterpart of :func:`load_countmask` for checkpoints trained
+    on the pretraining diet (v8 onward). Zero events correctly renders all-white — the
+    empty frame in this representation — via :func:`accumulate_numpy`'s own guard.
+    """
+    x, y, t, p, height, width = read_events(path)
+    return accumulate_numpy(x, y, t, p, height, width)
+
+
+def accumulate_numpy(x, y, t, p, height, width, pct=99.0):
+    """``[3, H, W]`` uint8 GEPT-native ``accumulate`` frame: WHITE background,
+    winner-take-all red/blue polarity, soft inverse activity mask.
+
+    eventcv has no ``accumulate`` renderer, so unlike countmask this cannot delegate to
+    it. Ported op-for-op from gept's ``representations.accumulate_numpy`` (itself the
+    byte-verified port of the upstream ``accumulate_to_rgb`` the GEPT checkpoints were
+    pretrained on) so the floats — and therefore the uint8 truncation — are identical
+    (pinned by tests/test_accumulate_render.py). ``t`` is unused: no time channel.
+    Polarity is ``p > 0``, correct for both {0,1} and {-1,+1} streams — upstream GEP's
+    own ``astype(bool)`` makes -1 truthy, the trap this port avoids.
+    """
+    m = (x < width) & (y < height) & (x >= 0) & (y >= 0)
+    xv = x[m].astype(np.int64)
+    yv = y[m].astype(np.int64)
+    pol = p[m] > 0
+    pos = np.zeros((height, width), dtype=np.float32)
+    neg = np.zeros((height, width), dtype=np.float32)
+    if xv.size:
+        np.add.at(pos, (yv[pol], xv[pol]), 1)
+        np.add.at(neg, (yv[~pol], xv[~pol]), 1)
+
+    def _norm(a):
+        if a.max() == 0:
+            return a
+        thr = np.percentile(a[a > 0], pct) if np.any(a > 0) else 1.0
+        if thr <= 0:
+            thr = float(a.max())
+        return np.clip(a, 0, thr) / thr
+
+    pos_n, neg_n = _norm(pos), _norm(neg)
+    dominate_pos = pos_n >= neg_n
+    inten_pos = pos_n * dominate_pos
+    inten_neg = neg_n * (~dominate_pos)
+    R = np.ones((height, width), dtype=np.float32)
+    G = np.ones((height, width), dtype=np.float32)
+    B = np.ones((height, width), dtype=np.float32)
+    G -= inten_pos; B -= inten_pos             # positive events -> red
+    R -= inten_neg; G -= inten_neg             # negative events -> blue
+    img = np.stack([np.clip(R, 0, 1), np.clip(G, 0, 1), np.clip(B, 0, 1)], axis=0)
+    return (img * 255).astype(np.uint8)
+
+
 def _area_resize(frame, size):
     """``[C, H, W]`` float32 -> ``[C, size, size]`` by area averaging.
 

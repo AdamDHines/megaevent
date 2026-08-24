@@ -29,10 +29,15 @@ sunset1's own illumination. The two protocols differ by ~14 points at the same c
 (P64: .698 pairwise vs .823 pooled), so a `tab:nval` built on the pairwise numbers cannot be
 read against the main table.
 
-Only P64 has been scored pooled. `--brisbane pooled` prints what exists and names the missing
-banks rather than silently falling back.
+All three N now have pooled banks (`psweep_no_sunset2.json`), so `--brisbane pooled` is the
+default: it is the protocol the paper's main Brisbane column reports, and a `tab:nval` on the
+pairwise numbers cannot be read against that table. `--brisbane pairwise` is still available.
 
-Both protocols are read at the shipping descriptor space, PCA (4096, 0.5), at 322^2.
+**Both protocols are read in the native descriptor space — no PCA whitening.** These models are
+not whitened anywhere else in the project, and whitening is not neutral here: it adds ~7.7
+points to every Brisbane cell and compresses the N=32->64 Tokyo spread from 3.5 points to 5.7,
+so a whitened `tab:nval` is partly measuring how well a 4096-d basis fits each bank rather than
+what N did. The banks already carry `native`, so this is a key change, not a rescore.
 """
 
 import argparse
@@ -48,7 +53,7 @@ BRISBANE_PAIRWISE = f"{ROOT}/brisbane_v4/results.json"
 # run wrote the bare tag, which is why final_no_sunset2.json is not the file read here.
 BRISBANE_POOLED = f"{ROOT}/brisbane_pooled/psweep_no_sunset2.json"
 
-SPACE = "pca4096p0.5"
+SPACE = "native"
 # N -> (tokyo/brisbane-pairwise result key, pooled result key)
 ROWS = [
     (32, "P32_s10000", "r322ba50_P32_s10000"),
@@ -81,7 +86,7 @@ def brisbane_pooled(doc, key):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--brisbane", choices=["pairwise", "pooled"], default="pairwise")
+    ap.add_argument("--brisbane", choices=["pairwise", "pooled"], default="pooled")
     cli = ap.parse_args()
 
     tok = json.load(open(TOKYO))

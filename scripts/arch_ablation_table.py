@@ -11,19 +11,17 @@ Brisbane pools `{daytime, morning, night, sunrise}` and **excludes `sunset2`**: 
 route recorded under sunset1's own illumination, so a pooled number that includes it is carried
 by near-duplicate retrieval rather than by condition invariance.
 
-**Every arm is reported in one descriptor space: dim 4096, power 0.5.** `pca_fit` clamps the dim
-to the descriptor width, so that is the full-rank 2048-d basis for GeM and a 4096-d projection of
-SALAD's 8448 — one setting, no per-aggregator or per-arm tuning, and the same space the two
-shipping checkpoints were already scored in.
+**Every arm is reported in the native descriptor space — no PCA whitening.** These methods are
+not whitened anywhere else in this project, and an ablation over fine-tuning depth and
+aggregator has to be read in the space the models actually ship in; a whitened cell measures
+the aggregator *plus* how well a 4096-d basis fits it, which is a second variable the table
+does not name. The banks already carry `native` alongside the whitened spaces, so this is a
+key change rather than a rescore.
 
-GeM was given its own power to compete in (`--pca ... 2048,0.25`, following the note at
-`src/inference.py:52` that 0.25 is the GeM optimum) and the full grid says it does not want one:
-0.25 beats 0.5 in 2 of the 8 GeM cells — the two ViT-S Tokyo arms — and loses the other 6,
-including all four on Brisbane. So the extra power is a Tokyo/ViT-S accident, not an aggregator
-property, and reporting it per arm would be selection on the test set. It changes no ordering
-either way: even taking each GeM arm's *best* space per dataset, the strongest GeM number stays
-below the weakest SALAD (Ours) number on both datasets. The full grid is printed underneath so
-the choice is visible rather than hidden.
+The whitened spaces are still printed in the full grid underneath, and the choice matters:
+whitening is worth far more to GeM than to SALAD, so a whitened table understates the
+aggregator gap this ablation exists to measure. `--pca ... 2048,0.25` was included because
+`src/inference.py:52` notes 0.25 as the GeM optimum; it is in the grid, unreported.
 """
 
 import json
@@ -56,7 +54,7 @@ SHIP_ROWS = [
     ("s_ship", "ViT-S ft4 + SALAD (Ours, shipped)", "salad"),
     ("b_ship", "ViT-B full + SALAD (Ours, shipped)", "salad"),
 ]
-SPACE = {"salad": "pca4096p0.5", "gem": "pca4096p0.5"}
+SPACE = {"salad": "native", "gem": "native"}
 # brisbane_pooled tags every arm with its run config; the sweep's arms are `r322ba50_<label>`.
 BRIS_PREFIX = "r322ba50_"
 

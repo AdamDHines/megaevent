@@ -102,16 +102,44 @@ def _slice_source(traverse, transform, args):
             hot_pixel=not args.no_hot_pixel,
             filter_dt_us=args.filter_dt_us,
         )
-    if args.representation != "countmask":
-        raise SystemExit(
-            f"the npz arms render via src.npzdata, which supplies countmask for this "
-            f"model — the checkpoint asks for '{args.representation}'")
     paths = tnpz.frame_paths(args.npz_root, args.dataset, source, traverse)
-    return tnpz.NpzTraverseDataset(paths, tnpz.countmask_loader(transform))
+    # frame_loader raises on a representation src.npzdata cannot render, which is the
+    # guard that used to live here when countmask was the only one it supplied.
+    return tnpz.NpzTraverseDataset(paths, tnpz.frame_loader(transform, args.representation))
 
 
-def extract(loaded, transform, traverse, args, out_dir, tag, device, batch_size, workers):
-    """One pass over a traverse's slices, fanned out to every checkpoint. -> {label: path}"""
+def _forward(model, frames, autocast, oom_backoff, tag=""):
+    """``model(frames)`` -> ``[B, D]`` float32 numpy, halving the batch on a CUDA OOM.
+
+    Splitting the batch is only sound for models whose descriptor depends on one frame at a
+    time — then it is a pure memory knob and the rows come back bit-identical. CricaVPR's
+    cross-image encoder attends over the *batch axis*, so there a smaller batch is a
+    different measurement rather than a smaller footprint: those callers pass
+    ``oom_backoff=False`` and the OOM propagates instead of quietly changing the numbers.
+    """
+    try:
+        with autocast:
+            return model(frames).float().cpu().numpy()
+    except torch.cuda.OutOfMemoryError:
+        if not oom_backoff or frames.shape[0] == 1:
+            raise
+        torch.cuda.empty_cache()
+        half = frames.shape[0] // 2
+        print(f"    {tag}: CUDA OOM at batch {frames.shape[0]} — retrying as "
+              f"{half}+{frames.shape[0] - half}", flush=True)
+        first = _forward(model, frames[:half], autocast, oom_backoff, tag)
+        second = _forward(model, frames[half:], autocast, oom_backoff, tag)
+        return np.concatenate([first, second], axis=0)
+
+
+def extract(loaded, transform, traverse, args, out_dir, tag, device, batch_size, workers,
+            oom_backoff=False):
+    """One pass over a traverse's slices, fanned out to every checkpoint. -> {label: path}
+
+    ``oom_backoff`` halves the batch and retries when the card is out of memory, for models
+    where batch size is a memory knob only — see :func:`_forward`. Off by default so every
+    existing caller keeps its current all-or-nothing behaviour.
+    """
     dataset = _slice_source(traverse, transform, args)
     n = len(dataset)
     files = {name: os.path.join(out_dir, f"{tag}_{traverse}_{name}.npy") for name, _, _ in loaded}
@@ -130,8 +158,7 @@ def extract(loaded, transform, traverse, args, out_dir, tag, device, batch_size,
             frames = batch.to(device, non_blocking=True)
             size = frames.shape[0]
             for name, _, model in loaded:
-                with autocast:
-                    desc = model(frames).float().cpu().numpy()
+                desc = _forward(model, frames, autocast, oom_backoff, f"{tag} {traverse}")
                 if name not in banks:
                     banks[name] = np.lib.format.open_memmap(
                         files[name], mode="w+", dtype=np.float32, shape=(n, desc.shape[1]))

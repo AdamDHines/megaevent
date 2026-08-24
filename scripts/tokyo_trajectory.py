@@ -178,9 +178,17 @@ def extract(loaded, transform, paths, out_dir, tag, device, batch_size, workers)
 
 
 def parse_pca(specs, default=PCA_SETTINGS):
-    """``["4096,0.5", ...]`` -> ``[(4096, 0.5), ...]``; ``None`` keeps ``default``."""
+    """``["4096,0.5", ...]`` -> ``[(4096, 0.5), ...]``; ``None`` keeps ``default``.
+
+    ``["none"]`` returns ``[]`` — score in the native descriptor space only. A whitening
+    basis is fit on the model's own database bank, so reporting it is a per-model tuning
+    step rather than a measurement (see ``table_native.py``); the native column is what the
+    model actually produces.
+    """
     if not specs:
         return list(default)
+    if len(specs) == 1 and specs[0].lower() in ("none", "off"):
+        return []
     out = []
     for spec in specs:
         dim, _, power = spec.partition(",")

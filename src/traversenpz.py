@@ -155,19 +155,32 @@ def count_plane_loader():
     return load
 
 
-def countmask_loader(transform):
+def frame_loader(transform, representation="countmask"):
     """MegaEvent's renderer: ``.npz`` -> ``[3,H,W]`` uint8 -> float [0,1] -> ``transform``.
 
     The same three steps :class:`src.inference.EventStreamDataset` applies to an eventcv
-    frame, and ``src.npzdata.load_countmask`` is documented byte-identical to eventcv's own
-    countmask — so a bank built here and one built from the HDF5 differ only by their events.
+    frame. ``src.npzdata.load_countmask`` is documented byte-identical to eventcv's own
+    countmask, and ``load_accumulate`` is pinned to the training renderer by
+    tests/test_accumulate_render.py — so a bank built here and one built from the HDF5
+    differ only by their events, whichever representation the checkpoint asks for.
     """
     import torch
 
-    from src.npzdata import load_countmask
+    from src.npzdata import load_accumulate, load_countmask
+
+    renderers = {"countmask": load_countmask, "accumulate": load_accumulate}
+    if representation not in renderers:
+        raise ValueError(f"no npz renderer for representation '{representation}' "
+                         f"(have: {sorted(renderers)})")
+    render = renderers[representation]
 
     def load(path):
-        frame = np.ascontiguousarray(load_countmask(path))
+        frame = np.ascontiguousarray(render(path))
         return transform(torch.from_numpy(frame).float().div_(255.0))
 
     return load
+
+
+def countmask_loader(transform):
+    """Backward-compatible alias for :func:`frame_loader` at its historical default."""
+    return frame_loader(transform, "countmask")

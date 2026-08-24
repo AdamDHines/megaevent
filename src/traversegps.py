@@ -48,19 +48,37 @@ EARTH_RADIUS_M = 6378137.0
 CLOCK_OFFSET_FILE = "clock_offsets.json"
 
 
-def clock_offsets(eventlab_dir, dataset):
-    """``({seq: offset_s}, {seq: drift_s_per_s})``, or two empty dicts if never fitted.
+def clock_offsets(eventlab_dir, dataset, required=None):
+    """``({seq: offset_s}, {seq: drift_s_per_s})`` from the fitted calibration file.
 
-    A constant offset alone leaves a ~10 m residual on the traverses whose clock *rate* is
-    also wrong — sunset2's runs 0.29% fast, accumulating 1.85 s (~26 m) end to end, which is
-    more than a 25 m tolerance can absorb. The drift term takes every pair to 3.7-6.2 m.
+    NB the file actually on disk is the **offset-only** fit (all drifts 0.0,
+    ``mean_residual_m`` 8.86); a drift term was measured to tighten pairs to 3.7-6.2 m but
+    has not been re-fitted into the shipped file, so every current Brisbane number rests on
+    the 8.86 m residual — safely inside a 25 m radius either way.
+
+    ``required``: raise unless the file exists AND covers these sequences. Brisbane MUST
+    pass its traverses here — two Brisbane trees exist on this machine and only one carries
+    the calibration; falling back silently to zero offsets puts "the same place" a median
+    19-104 m apart and turns a 25 m benchmark into a clock measurement.
     """
     path = os.path.join(eventlab_dir, dataset, CLOCK_OFFSET_FILE)
     if not os.path.exists(path):
+        if required:
+            raise SystemExit(
+                f"missing clock calibration: {path}\nThis dataset's camera and GPS clocks "
+                f"disagree by up to 7 s (~100 m); without the fitted offsets every metric "
+                f"tolerance is meaningless. Either --eventlab-dir points at the wrong tree "
+                f"(the calibrated one carries {CLOCK_OFFSET_FILE}) or the fit was never "
+                f"run: scripts/calibrate_brisbane_clock.py --write.")
         return {}, {}
     with open(path) as handle:
         table = json.load(handle)
-    return table.get("offsets", {}), table.get("drifts", {})
+    offsets, drifts = table.get("offsets", {}), table.get("drifts", {})
+    missing = sorted(set(required or ()) - set(offsets))
+    if missing:
+        raise SystemExit(f"{path} has no clock offset for {missing} — re-run "
+                         f"scripts/calibrate_brisbane_clock.py --write to cover them.")
+    return offsets, drifts
 
 
 def nmea_track(path):
@@ -197,7 +215,9 @@ def frame_coords(eventlab_dir, dataset, seq, lat0, lon0, dt_ms=50, npz_root=None
     checked = (check_slice_times(npz_root, dataset, seq, start_s, n_frames)
                if npz_root else False)
     if offsets is None:
-        offsets, drifts = clock_offsets(eventlab_dir, dataset)
+        # required: a Brisbane tree without the calibration must stop the run, not score
+        # with zero offsets (two trees exist locally; only one is calibrated).
+        offsets, drifts = clock_offsets(eventlab_dir, dataset, required=(seq,))
     else:
         offsets, drifts = offsets
     shift = float(offsets.get(seq, 0.0))

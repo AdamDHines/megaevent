@@ -208,6 +208,13 @@ def run(args):
         q_desc = torch.from_numpy(np.asarray(cached_array(
             args, method, args.query, q_paths, "",
             lambda p, s: method.descriptors(p, s), "descriptors")))
+        if getattr(args, "banks_only", False):
+            # Both banks and their manifests are on disk now, which is all
+            # scripts/score_cached_banks.py needs. Stop before the dense matrix.
+            logger.info(f"--banks-only: cached {tuple(db_desc.shape)} {args.ref} and "
+                        f"{tuple(q_desc.shape)} {args.query} descriptors under "
+                        f"'{method.tag}' -> {out_dir}; scoring skipped")
+            return
         native, pca_out = _score_both(
             method, db_desc, q_desc, gt, device, results, curves,
             paths=(db_paths, q_paths), map_ks=KS if args.dataset == "msls" else ())
