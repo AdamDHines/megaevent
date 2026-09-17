@@ -1,6 +1,7 @@
 """Reference/query workflow shared by the CLI and Python API."""
 
 import csv
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -80,6 +81,10 @@ def descriptor_bank(
     if destination.exists():
         return np.load(destination, mmap_mode="r")
 
+    # determine number of workers if workers == 0
+    if workers == 0:
+        workers = min(32, (os.cpu_count() or 1) + 4)
+
     return extract(
         model,
         dataset,
@@ -106,7 +111,7 @@ def save_previews(root, reference, query, indices, scores, count):
             image.thumbnail((width, height - 30))
             canvas.paste(image, (column * width, 0))
             draw.text((column * width + 4, height - 25), label[:30], fill="black")
-        canvas.save(root / f"{i:08d}.jpg")
+        canvas.save(root / f"{query.samples[i]['id']}.jpg")
 
 
 def retrieve(args):
@@ -119,7 +124,7 @@ def retrieve(args):
     # set up the retrieval parameters and model
     started = time.monotonic()
     target = device_for(args.device)
-    path = args.checkpoint or resolve_model(args.model, args.ckpt_dir, args.offline)
+    path = resolve_model(args.model, args.ckpt_dir)
     network, cfg = load_model(path, target)
 
     # define the reference and query datasets
@@ -134,12 +139,33 @@ def retrieve(args):
         else None
     )
 
+    # eyeball mode: retrieve a random handful of the EventCV query slices, not all of them
+    if args.save_previews:
+        chosen = np.random.default_rng().choice(
+            len(qry.samples), min(args.save_previews, len(qry.samples)), replace=False
+        )
+        chosen = sorted(int(i) for i in chosen)
+        qry.samples = [qry.samples[i] for i in chosen]
+        if positives is not None:
+            positives = [positives[i] for i in chosen]
+
     # run the descriptor generators
     bank = Path(args.descriptor_dir) / args.model / f"{args.window_ms:g}ms"
     db = descriptor_bank(network, ref, bank / ref.path.stem, target, args.batch_size, args.workers)
-    queries = descriptor_bank(
-        network, qry, bank / qry.path.stem, target, args.batch_size, args.workers
-    )
+    if args.save_previews:
+        # the sampled slices differ every run, so never cache or reuse this bank
+        queries = extract(
+            network,
+            qry,
+            bank / qry.path.stem / "sampled.npy",
+            target,
+            args.batch_size,
+            args.workers,
+        )
+    else:
+        queries = descriptor_bank(
+            network, qry, bank / qry.path.stem, target, args.batch_size, args.workers
+        )
 
     # score the descriptors
     ranked, scores = topk(

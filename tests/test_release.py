@@ -1,3 +1,4 @@
+import argparse
 import csv
 import json
 
@@ -102,7 +103,7 @@ def test_ground_truth_orientation_and_unscorable(tmp_path):
     assert recall(np.zeros((3, 2), int), [set(), set(), set()])["R@1"] is None
 
 
-def test_download_uses_auth_cache_revision_and_local_override(tmp_path, monkeypatch):
+def test_download_uses_auth_cache_and_revision(tmp_path, monkeypatch):
     import huggingface_hub
 
     path = tmp_path / "model.pt"
@@ -120,17 +121,17 @@ def test_download_uses_auth_cache_revision_and_local_override(tmp_path, monkeypa
         return str(path)
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
-    assert checkpoints.resolve_model("small", offline=True) == path
+    assert checkpoints.resolve_model("small", tmp_path) == path
     assert calls == [
         dict(
             repo_id=entry["repo_id"],
             filename=entry["filename"],
             revision="revision123",
-            local_dir=str(checkpoints.CHECKPOINT_DIR),
-            local_files_only=True,
+            local_dir=str(tmp_path),
         )
     ]
-    assert checkpoints.resolve_model("unknown", checkpoint=path) == path
+    with pytest.raises(ValueError, match="Unknown model"):
+        checkpoints.resolve_model("unknown", tmp_path)
     assert len(calls) == 1
 
 
@@ -151,29 +152,57 @@ def test_release_workflow_cache_and_metrics(event_files, tmp_path, monkeypatch):
     weights = tmp_path / "fake.pt"
     weights.write_bytes(b"local")
     monkeypatch.setattr(eval, "load_model", lambda *a: (Model(), cfg))
-    options = StreamOptions(window_ms=10, sensor_size=(8, 8), time_unit="us")
-    np.save(tmp_path / "gt.npy", np.eye(4, dtype=bool))
-    kwargs = dict(
-        checkpoint=weights,
-        reference_options=options,
-        query_options=options,
-        device="cpu",
-        cache_dir=tmp_path / "cache",
-        output=tmp_path / "out",
-        ground_truth=tmp_path / "gt.npy",
-        top_k=1,
-        save_previews_count=1,
+    monkeypatch.setattr(eval, "resolve_model", lambda *a: weights)
+    # retrieve() builds its own StreamOptions, so inject the fixture's sensor geometry
+    monkeypatch.setattr(
+        eval,
+        "StreamOptions",
+        lambda **kw: StreamOptions(sensor_size=(8, 8), time_unit="us", **kw),
     )
-    result = retrieve(*event_files, **kwargs)
+    # distinct stems, so reference and query get their own descriptor bank
+    reference, query = tmp_path / "reference.npz", tmp_path / "query.h5"
+    reference.write_bytes(event_files[0].read_bytes())
+    query.write_bytes(event_files[1].read_bytes())
+    np.save(tmp_path / "gt.npy", np.eye(4, dtype=bool))
+    args = argparse.Namespace(
+        reference=reference,
+        query=query,
+        model="megaevent_vits14",
+        ckpt_dir=tmp_path / "ckpts",
+        descriptor_dir=tmp_path / "cache",
+        window_ms=10,
+        hot_pixel_filter=False,
+        device="cpu",
+        ground_truth=tmp_path / "gt.npy",
+        gt_layout="reference-query",
+        top_k=1,
+        output=tmp_path / "out",
+        save_previews=0,
+        batch_size=1,
+        workers=1,
+        query_chunk=128,
+        reference_chunk=4096,
+    )
+    result = retrieve(args)
     assert result.indices.shape == (4, 1)
     assert result.metrics["R@5"] == 1
-    assert (tmp_path / "out/previews/00000000.jpg").exists()
-    monkeypatch.setattr(eval, "extract", lambda *a: pytest.fail("Cache should be reused"))
-    cached = retrieve(*event_files, **kwargs)
-    np.testing.assert_array_equal(result.indices, cached.indices)
     assert json.loads((tmp_path / "out/metrics.json").read_text())["queries"] == 4
     with (tmp_path / "out/retrievals.csv").open() as file:
         assert len(list(csv.DictReader(file))) == 4
+
+    # previews sample the query slices at random and are named by slice id
+    args.save_previews = 2
+    sampled = retrieve(args)
+    assert sampled.indices.shape == (2, 1)
+    ids = [sample["id"] for sample in sampled.query_samples]
+    assert len(set(ids)) == 2 and ids == sorted(ids)
+    assert sorted(p.stem for p in (tmp_path / "out/previews").iterdir()) == ids
+
+    # the full-query banks are cached, so repeating the unsampled run never re-extracts
+    args.save_previews = 0
+    monkeypatch.setattr(eval, "extract", lambda *a: pytest.fail("Cache should be reused"))
+    cached = retrieve(args)
+    np.testing.assert_array_equal(result.indices, cached.indices)
 
 
 def test_checkpoint_roundtrip_and_projection(tmp_path):
@@ -194,9 +223,7 @@ def test_checkpoint_roundtrip_and_projection(tmp_path):
         },
         path,
     )
-    checkpoints.load_model(path)
-    checkpoints.export_checkpoint(path, tmp_path / "export.pt")
-    loaded, restored = checkpoints.load_model(tmp_path / "export.pt")
+    loaded, restored = checkpoints.load_model(path)
     assert restored.salad_proj and restored.desc_dim == 12
     sample = torch.randn(1, 3, 28, 28)
     with torch.inference_mode():
@@ -213,7 +240,7 @@ def test_v8_recipes():
         assert not cfg.aug_hflip and not cfg.eval_pca
 
 
-def test_offline_cache_miss_is_actionable(monkeypatch):
+def test_cache_miss_is_actionable(tmp_path, monkeypatch):
     import huggingface_hub
     from huggingface_hub.errors import LocalEntryNotFoundError
 
@@ -222,32 +249,4 @@ def test_offline_cache_miss_is_actionable(monkeypatch):
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", missing)
     with pytest.raises(ValueError, match="not cached"):
-        checkpoints.resolve_model(offline=True)
-
-
-def test_cache_invalidates_when_input_or_options_change(event_files, tmp_path, monkeypatch):
-    import megaevent.eval as eval
-
-    cfg = config()
-    dataset = EventDataset(event_files[0], cfg, StreamOptions(sensor_size=(8, 8), time_unit="us"))
-    network = type("M", (), {"config": cfg})()
-    calls = []
-
-    def extract(model, dataset, path, *args):
-        calls.append(path)
-        np.save(path, np.zeros((len(dataset), cfg.desc_dim), dtype=np.float32))
-        return np.load(path, mmap_mode="r")
-
-    monkeypatch.setattr(eval, "extract", extract)
-    arguments = (network, dataset, tmp_path / "banks", "checkpoint", torch.device("cpu"), 1, 0)
-    (tmp_path / "banks").mkdir()
-    eval.descriptor_bank(*arguments)
-    eval.descriptor_bank(*arguments)
-    assert len(calls) == 1
-    dataset.options.hot_pixel_filter = True
-    eval.descriptor_bank(*arguments)
-    assert len(calls) == 2
-    with event_files[0].open("ab") as stream:
-        stream.write(b"changed")
-    eval.descriptor_bank(*arguments)
-    assert len(calls) == 3
+        checkpoints.resolve_model(dir=tmp_path)

@@ -45,7 +45,7 @@ def registry():
     return json.loads(files(__package__).joinpath("models.json").read_text())
 
 
-def resolve_model(name="megaevent_vits14", dir="./src/ckpts", offline=False):
+def resolve_model(name="megaevent_vits14", dir="./src/ckpts"):
     """Return a local checkpoint path, downloading a registry model into src/ckpts if needed."""
 
     dir = Path(dir)
@@ -57,7 +57,7 @@ def resolve_model(name="megaevent_vits14", dir="./src/ckpts", offline=False):
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 
-    if not (dir / entry["filename"]).is_file() and not offline:
+    if not (dir / entry["filename"]).is_file():
         logger.info(f"Downloading {name} from {entry['repo_id']} into {dir}")
     try:
         path = Path(
@@ -66,7 +66,6 @@ def resolve_model(name="megaevent_vits14", dir="./src/ckpts", offline=False):
                 filename=entry["filename"],
                 revision=entry["revision"],
                 local_dir=str(dir),
-                local_files_only=offline,
             )
         )
     except LocalEntryNotFoundError as exc:

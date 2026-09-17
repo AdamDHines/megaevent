@@ -108,15 +108,16 @@ class EventDataset(Dataset):
         return self._reader
 
     def frame(self, index):
+        sample = self.samples[index]
         if self.folder:
             kwargs = self.options.kwargs()
             kwargs.pop("dt_ms")
             hot = kwargs.pop("hot_pixel_filter")
-            stream = ecv.load(str(self.paths[index]), **kwargs)
+            stream = ecv.load(sample["path"], **kwargs)
             if hot:
                 stream = stream.hot_pixel_filter()
         else:
-            stream = self.reader.slice(index)
+            stream = self.reader.slice(sample["slice"])
         return render_stream(stream, self.representation, self.options.window_ms)
 
     def __getitem__(self, index):

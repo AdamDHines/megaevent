@@ -16,6 +16,8 @@ tqdm = "*"
 loguru = "*"
 huggingface_hub = "*"
 torchvision = "*"
+pandas = "*"
+pytorch-metric-learning = "*"
 
 [target.linux-64.dependencies]
 cuda-version = "12.*"

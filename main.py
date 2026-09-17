@@ -11,30 +11,54 @@ from src.megaevent.checkpoints import resolve_model
 def parser():
     args = argparse.ArgumentParser(description="Args for megaevent running")
 
-    args.add_argument("mode", choices=["eval", "train"], help="Mode to run megaevent")
+    # megaevent mode to run
+    args.add_argument("--mode", "-m", choices=["eval", "train"], default="eval",
+                       help="Mode to run megaevent")
 
-    args.add_argument("--reference", required=True, help="Reference event file or directory")
-    args.add_argument("--query", required=True, help="Query event file or directory")
-    args.add_argument("--checkpoint", help="Local checkpoint, skips the --model download")
-    args.add_argument("--window-ms", type=float, default=50)
-    args.add_argument("--hot-pixel-filter", action="store_true")
-    args.add_argument("--model", choices=["megaevent_vits14", "megaevent_vitb14"], default="megaevent_vits14", 
-                          help="Downloaded into src/ckpts on first use")
+    # reference/query retrieval args
+    args.add_argument("--reference", required=True, type=str,
+                      help="Reference event file or directory")
+    args.add_argument("--query", required=True, type=str,
+                       help="Query event file or directory")
+    args.add_argument("--window-ms", type=float, default=50,
+                      help="Window size in milliseconds for event slicing")
+    args.add_argument("--hot-pixel-filter", action="store_true",
+                      help="Filter hot pixels from event streams using eventcv (recommended)")
+    args.add_argument("--model", type=str, choices=["megaevent_vits14", "megaevent_vitb14"], default="megaevent_vits14", 
+                          help="megaevent model to use for evaluation")
+
+    # directory args
     args.add_argument("--ckpt-dir", type=str, default="./src/ckpts",
                           help = "Directory where checkpoints are stored")
     args.add_argument("--descriptor-dir", type=str, default="./src/descriptors",
                           help = "Directory where descriptor banks are stored")
-    args.add_argument("--offline", action="store_true")
-    args.add_argument("--ground-truth", help="Optional .npy matrix or query_id,reference_id CSV")
-    args.add_argument("--gt-layout", choices=["reference-query", "query-reference"], default="reference-query")
-    args.add_argument("--top-k", type=int, default=5)
-    args.add_argument("--output", help="Default: results/<reference>_<query>")
-    args.add_argument("--device", default="auto")
-    args.add_argument("--batch-size", type=int, default=16)
-    args.add_argument("--workers", type=int, default=0)
-    args.add_argument("--query-chunk", type=int, default=128)
-    args.add_argument("--reference-chunk", type=int, default=4096)
-    args.add_argument("--save-previews", type=int, default=0)
+
+    # recall arguments
+    args.add_argument("--ground-truth", type=str, default=None,
+                       help="Optional .npy matrix or query_id,reference_id CSV")
+    args.add_argument("--gt-layout", type=str, choices=["reference-query", "query-reference"], default="reference-query",
+                       help="Ground truth layout for .npy matrix or CSV")
+    args.add_argument("--top-k", type=int, default=5,
+                       help="Number of top results to return")
+
+    # output and results args
+    args.add_argument("--output", type=str,help="Default: results/<reference>_<query>",
+                      default=None)
+    args.add_argument("--save-previews", type=int, default=0,
+                      help="Randomly sample N query slices and save their top-k retrievals as "
+                           "images for visual inspection; 0 runs the full query file")
+
+    # device args
+    args.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"],
+                      help="Device to run the model on (recommended: auto)")
+    args.add_argument("--batch-size", type=int, default=32,
+                      help="Batch size for descriptor generation")
+    args.add_argument("--workers", type=int, default=0,
+                      help="Number of workers for data loading, 0 for auto-detection: recommended 0")
+    args.add_argument("--query-chunk", type=int, default=4096,
+                      help="Chunk size for query descriptor generation")
+    args.add_argument("--reference-chunk", type=int, default=4096,
+                      help="Chunk size for reference descriptor generation")
 
     # models = commands.add_parser("models").add_subparsers(dest="action", required=True)
     # models.add_parser("list")
@@ -79,15 +103,14 @@ def main():
         logger.info(f"Reference {args.reference}, query {args.query}, log {logfile}")
 
         # check existence ofthe model and download it
-        if args.checkpoint is None:
-            if args.model == "megaevent_vitb14" or args.model == "megaevent_vits14":
-                logger.info(f"Looking for {args.model} in {args.ckpt_dir}")
-                args.checkpoint = resolve_model(args.model, args.ckpt_dir, args.offline)
-            else:
-                raise ValueError(
-                    f"{args.model} is not a recognised model, please use either "
-                    "megaevent_vitb14 or megaevent_vits14"
-                )
+        if args.model == "megaevent_vitb14" or args.model == "megaevent_vits14":
+            logger.info(f"Looking for {args.model} in {args.ckpt_dir}")
+            args.checkpoint = resolve_model(args.model, args.ckpt_dir)
+        else:
+            raise ValueError(
+                f"{args.model} is not a recognised model, please use either "
+                "megaevent_vitb14 or megaevent_vits14"
+            )
 
         # run the retrieval
         result = retrieve(args)
