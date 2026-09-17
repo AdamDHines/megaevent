@@ -15,6 +15,7 @@ ruff = "*"
 tqdm = "*"
 loguru = "*"
 huggingface_hub = "*"
+torchvision = "*"
 
 [target.linux-64.dependencies]
 cuda-version = "12.*"
@@ -41,11 +42,9 @@ safetensors = "*"
 
 [target.win-64.dependencies]
 pytorch-gpu = "*"
-torchvision = "*"
 
 [target.osx-arm64.dependencies]
 pytorch = "*"
-torchvision = "*"
 
 [tasks]
 megaevent = "python -m megaevent"

@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from megaevent.evaluation import recall_at_k_cross
+from megaevent.recall import recall_at_k_cross
 from megaevent.training.i2eval import build_msls_val
 
 

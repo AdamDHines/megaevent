@@ -240,3 +240,4 @@ src/ckpts/
 src/data/
 results/
 *.Ds_Store
+src/descriptors/

@@ -2,7 +2,7 @@
 
 import torch
 
-from ..evaluation import recall_at_k_cross as recall_at_k_cross
+from ..recall import recall_at_k_cross as recall_at_k_cross
 from .dataset import FlatImageDataset, build_transforms, make_flat_loader
 
 

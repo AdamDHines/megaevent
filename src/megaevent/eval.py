@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .checkpoints import load_model, resolve_model
-from .evaluation import load_positives, recall
+from .recall import load_positives, recall
 from .events import EventDataset, StreamOptions
 from .retrieval import topk
 from .runtime import atomic_write, device_for, write_json

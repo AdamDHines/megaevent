@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from ..evaluation import recall_at_k_cross as recall_at_k_cross
+from ..recall import recall_at_k_cross as recall_at_k_cross
 from ..events import eval_transform
 
 # Brisbane-Event / ED-VPR tencode bins are 50 ms (20 Hz); DAVIS346 is 346x260.

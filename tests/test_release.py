@@ -10,7 +10,7 @@ import torch
 from megaevent import checkpoints
 from megaevent.eval import retrieve
 from megaevent.config import VPRConfig
-from megaevent.evaluation import load_positives, recall
+from megaevent.recall import load_positives, recall
 from megaevent.events import EventDataset, StreamOptions
 from megaevent.model import VPRModel
 from megaevent.retrieval import topk
