@@ -333,7 +333,7 @@ def evaluate(tag, sim, gt, device):
 
 
 def score_both(method, db_desc, q_desc, gt, device, results, curves, label="", paths=None,
-               map_ks=()):
+               map_ks=(), skip_pca=False):
     """Score one descriptor bank under the method's native metric *and* PCA whitening.
 
     Every method is reported both ways on purpose. Our own headline number uses
@@ -349,6 +349,13 @@ def score_both(method, db_desc, q_desc, gt, device, results, curves, label="", p
     second scoring pass over each query's shortlist, evaluated as a ``+rerank`` twin of every
     space, so the cost and benefit of that pass can be read off directly against the same
     method without it. Reranking needs the file lists, which is what ``paths`` carries.
+
+    ``skip_pca`` drops the whitened spaces entirely and reports the native metric alone,
+    returning it in both slots so callers that describe "the strongest space" describe the
+    native one. Use it when the experiment is native-only by design — an ablation read in the
+    space the models ship in, where a whitened cell would measure the aggregator *plus* how
+    well a 4096-d basis fits it. It also skips the fit itself, which on a large gallery is the
+    most memory-hungry step in the run: it is what killed both pitts250k runs.
     """
     def score(tag, sim):
         rec, curve, ranked, mask, sim = evaluate(tag, sim, gt, device)
@@ -373,7 +380,8 @@ def score_both(method, db_desc, q_desc, gt, device, results, curves, label="", p
 
     best = native
     results["pca"] = {}
-    for power in (PCA_POWER,) + tuple(getattr(method, "extra_pca_powers", ())):
+    powers = () if skip_pca else (PCA_POWER,) + tuple(getattr(method, "extra_pca_powers", ()))
+    for power in powers:
         pca = pca_fit_subsampled(db_desc, device, power=power)
         db_white, q_white = pca_apply(db_desc, pca, device), pca_apply(q_desc, pca, device)
         # The realised width, not pca["dim"]: svd_lowrank cannot return more components than

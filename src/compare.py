@@ -49,15 +49,20 @@ RERANK = "+rerank"
 # reads as "what the synthetic conversion cost". `None` is an image set, which has no arm.
 # The `_masked` pair repeats the comparison with the dead vignette removed from *both*
 # sides, which separates the domain gap from I2E's noise amplification in that region.
-SOURCE_ORDER = (None, "real", "i2e", "real_masked", "i2e_masked")
+SOURCE_ORDER = (None, "real", "i2e", "i2e_gopro", "real_masked", "i2e_masked")
 SOURCE_LABELS = {"real": "real events", "i2e": "I2E from DAVIS frames",
+                 "i2e_gopro": "I2E from the co-recorded video",
                  "real_masked": "real events, vignette masked",
                  "i2e_masked": "I2E from DAVIS frames, vignette masked"}
-# The pairs a Δ row is drawn for: (baseline, variant).
-SOURCE_PAIRS = (("real", "i2e"), ("real_masked", "i2e_masked"))
+# The pairs a Δ row is drawn for: (baseline, variant). `i2e -> i2e_gopro` isolates the source
+# imagery: same slice grid, same ground truth, same rows, a camera that can see the scene
+# instead of one that saturates 16% of it. `real -> i2e_gopro` is the sim2real gap as it
+# stands once the DAVIS's own intensity channel is no longer the bottleneck.
+SOURCE_PAIRS = (("real", "i2e"), ("real_masked", "i2e_masked"),
+                ("i2e", "i2e_gopro"), ("real", "i2e_gopro"))
 # Solid for a real arm, dashed for a synthetic one, in each method's own colour: two
 # nearly-coincident lines per method means the synthetic domain costs that method nothing.
-SOURCE_DASH = {None: "-", "real": "-", "i2e": (0, (4, 2)),
+SOURCE_DASH = {None: "-", "real": "-", "i2e": (0, (4, 2)), "i2e_gopro": (0, (6, 1, 2, 1)),
                "real_masked": (0, (1, 1)), "i2e_masked": (0, (5, 1, 1, 1))}
 
 

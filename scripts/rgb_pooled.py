@@ -187,14 +187,23 @@ def main():
                              "rendered locally — eventcv has no accumulate). Banks and the "
                              "output JSON carry an _accum tag so the arms never collide.")
     parser.add_argument("--norm-stats", default="imagenet",
-                        choices=["imagenet", "countmask"],
+                        choices=["imagenet", "countmask", "accumulate"],
                         help="normalisation constants for the control. 'imagenet' is each "
                              "model's own shipped preprocessing (the default and the "
-                             "published protocol). 'countmask' swaps in megaevent's "
-                             "event-training statistics — the fairness arm answering "
-                             "whether ImageNet stats handicap the controls on frames "
-                             "whose true channel means are ~0.10/0.28/0.10. Banks and the "
-                             "output JSON carry a _cmstats tag so the arms never collide.")
+                             "published protocol). 'countmask' and 'accumulate' swap in "
+                             "megaevent's event-training statistics for that "
+                             "representation — the fairness arm answering whether ImageNet "
+                             "stats handicap the controls on frames whose true channel "
+                             "means are ~0.10/0.28/0.10 (countmask, black bg) or "
+                             "~0.95/0.88/0.93 (accumulate, white bg). Match this to "
+                             "--representation: the wrong pair is worse than ImageNet. "
+                             "Banks and the output JSON carry a _cmstats / _acstats tag so "
+                             "the arms never collide.")
+    parser.add_argument("--score-device", default="auto", choices=["auto", "cpu", "cuda"],
+                        help="where to run the ranking matmul. 'auto' follows extraction. "
+                             "'cpu' costs a few minutes and survives a GPU shared with "
+                             "another job — the banks are already on disk by then, so an "
+                             "OOM here throws away a completed extraction.")
     parser.add_argument("--workers", type=int, default=inf.NUM_WORKERS)
     cli = parser.parse_args()
 
@@ -225,9 +234,14 @@ def main():
     if cli.representation != "countmask":
         tag += "_accum"
     if cli.norm_stats != "imagenet":
-        tag += "_cmstats"
+        tag += "_cmstats" if cli.norm_stats == "countmask" else "_acstats"
     cli.fig_tag = f"{cli.dataset}_{tag}_{label}"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Extraction is batched and fits in ~2 GB; the scoring matmul is what needs headroom,
+    # and this card is often shared with another job. Splitting the two means a busy GPU
+    # costs minutes of CPU ranking instead of losing a finished extraction to an OOM.
+    score_device = (device if cli.score_device == "auto"
+                    else torch.device(cli.score_device))
     sequences = [cli.query, *cli.database]
 
     # no_event_filter=False, so _Args derives filter_dt_us = dt_ms * 1000 = 50,000 us: the
@@ -242,8 +256,12 @@ def main():
 
     model = loader(device)
     params = sum(p.numel() for p in model.parameters())
-    print(f"  {label} ({hub}, {params / 1e6:.1f}M params, {desc_dim}-d), "
-          f"ImageNet normalisation")
+    norm_note = ("ImageNet normalisation (the model's own)" if cli.norm_stats == "imagenet"
+                 else f"{cli.norm_stats}-matched normalisation (fairness arm)")
+    print(f"  {label} ({hub}, {params / 1e6:.1f}M params, {desc_dim}-d), {norm_note}")
+    if cli.norm_stats not in ("imagenet", cli.representation):
+        print(f"  WARNING: --norm-stats {cli.norm_stats} does not match --representation "
+              f"{cli.representation}; the wrong event stats are worse than ImageNet.")
 
     bp.assert_filter_active(args, cli.query, FILTER_DT_US)
 
@@ -281,7 +299,9 @@ def main():
                     f"{sequence}: eventcv yields {bank_frames[sequence]} slices but the pose "
                     f"grid has {len(geom[sequence][0])}")
 
-    result = bp.score_configuration(bank_files, geom, args, cli, label, device, tag)
+    if score_device != device:
+        print(f"  scoring on {score_device} (extraction used {device})")
+    result = bp.score_configuration(bank_files, geom, args, cli, label, score_device, tag)
     result.update({
         "method": cli.model, "source": "real", "filter_arm": "on",
         "event_filter_dt_us": FILTER_DT_US, "representation": cli.representation,
@@ -300,7 +320,8 @@ def main():
               "pca": [list(setting) for setting in cli.pca], "hot_pixel": True,
               "results": {tag: result}}
     suffix = "" if cli.representation == "countmask" else "_accumulate"
-    suffix += "" if cli.norm_stats == "imagenet" else "_cmstats"
+    suffix += ("" if cli.norm_stats == "imagenet"
+               else "_cmstats" if cli.norm_stats == "countmask" else "_acstats")
     out_json = os.path.join(cli.out_dir, f"{cli.dataset}{suffix}.json")
     tmp = out_json + ".tmp"
     with open(tmp, "w") as handle:

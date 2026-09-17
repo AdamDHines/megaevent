@@ -193,6 +193,9 @@ def main():
     parser.add_argument("--source", default="real", choices=list(tnpz.SOURCES),
                         help="which arm the events come from; see "
                              "scripts/brisbane_pooled.py")
+    parser.add_argument("--align-sources", nargs="+", default=None,
+                        help="frame trees whose select.json rows are OR-dropped by the "
+                             "alignment mask; default aps, plus gopro for i2e_gopro")
     cli = parser.parse_args()
 
     spec = DATASETS[cli.dataset]
@@ -206,6 +209,9 @@ def main():
     cli.db_chunk = spec["db_chunk"]
     synthetic = cli.source != "real"
     cli.aps_aligned = cli.aps_aligned or synthetic
+    cli.align_sources = (tuple(cli.align_sources) if cli.align_sources
+                         else (("aps", "gopro") if cli.source == "i2e_gopro"
+                               else ("aps",)))
     if synthetic and cli.dataset != "brisbane_event":
         raise SystemExit(f"--source {cli.source} exists only for brisbane_event")
     cli.fig_tag = (f"{cli.dataset}_eventvlad_ba50" if not synthetic
@@ -230,7 +236,8 @@ def main():
         geom = npl.traverse_geometry(root, sequences, DT_MS)
     else:
         geom = bp.traverse_geometry(args, sequences, spec["npz_root"],
-                                    aps_align=(synthetic or cli.aps_aligned))
+                                    aps_align=(synthetic or cli.aps_aligned),
+                                    align_sources=cli.align_sources)
 
     bank_files = {}
     for sequence in sequences:

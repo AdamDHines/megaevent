@@ -460,3 +460,145 @@ concern is partially supported and must be reported as such. (2) Post-release
 comparison: real native+rerank 0.7792 ~= post-release 0.7769 (generations equivalent
 again), but on i2e the post-release space was much stronger (0.629 vs 0.398 reranked)
 — same pattern as NSAVP. Results: v8_bench/eg010_sim2real.json.
+
+## 2026-09-10 — Why the event-trained model beats RGB VPR on event frames
+
+Question: given we train on a classical VPR regime, where does the advantage come from —
+are more features detected, are the features better, or are the descriptors more refined?
+
+**Short answer: the features. Almost all of the advantage is present in the patch tokens
+before any aggregation head exists, and it is not "more" features — it is the same 529
+tokens carrying a representation that survives the illumination change.**
+
+Protocol throughout: **single reference traverse**, native cosine, 25 m, no whitening
+(`pairwise_sunset_ref_*.json`). Pooled cells are not used — a pooled gallery holds several
+traverses of the same route, so a query needs only one of them to be an easy appearance
+match, and the cell stops measuring cross-condition retrieval.
+
+### 1. The size of the thing being explained
+
+`scripts/table_margin.py` (new; reads the single-reference ledger, whole roster, not just
+MegaLoc). R@1 is bounded, so the error ratio `(1-ours)/(1-theirs)` is reported beside the
+absolute margin — it is comparable across cells of different difficulty.
+
+| cell (ref -> query) | v8-B  | best control  | d R@1  | err ratio |
+|---------------------|-------|---------------|--------|-----------|
+| sunset1 -> daytime  | 0.706 | QAA    0.584  | +0.121 | 0.71      |
+| sunset1 -> morning  | 0.780 | MixVPR 0.651  | +0.129 | 0.63      |
+| sunset1 -> sunrise  | 0.882 | MixVPR 0.827  | +0.056 | 0.68      |
+| NSAVP FS0 -> FA0    | 0.841 | QAA    0.821  | +0.020 | 0.89      |
+| NSAVP RS0 -> RA0    | 0.806 | BoQ    0.757  | +0.049 | 0.80      |
+
+v8-B leads **5/5**. Brisbane: a **near-constant one third** of the remaining error removed
+across a 2.5x range of cell difficulty (0.63 / 0.68 / 0.71). NSAVP: 16%. The absolute margin
+doubling from +0.056 to +0.129 is the R@1 bound, not a condition-specific effect — the gain
+is uniform, which already points at the representation rather than at an illumination trick.
+
+**Roster caveat:** MegaLoc is 4th-5th on these cells. Quoting the margin against MegaLoc
+alone roughly doubles it (Brisbane daytime +0.121 vs QAA becomes +0.284 vs MegaLoc). MixVPR
+and QAA are the bar.
+
+### 2. Features or descriptor? — `scripts/backbone_probe.py` (new)
+
+Strip the aggregation head off every model and pool the 529 patch tokens with a
+**parameter-free** L2-normalised mean. Same frames, same rendering, same pooling, same
+ranking, same GT; the only thing that varies is which encoder read the frame. Each RGB
+backbone is run under both ImageNet and accumulate-matched statistics and keeps its better
+arm. Stride 5 (all arms identical; absolute R@1 is not comparable to a full-protocol cell,
+only the arms to each other).
+
+| frozen backbone | pretraining      | daytime | morning | sunrise | mean   |
+|-----------------|------------------|---------|---------|---------|--------|
+| dinov2-s        | RGB              | 0.130   | 0.155   | 0.211   | 0.166  |
+| gept-s          | **event**        | 0.165   | 0.162   | 0.267   | 0.198  |
+| salad           | RGB + VPR        | 0.169   | 0.175   | 0.259   | 0.201  |
+| megaloc         | RGB + VPR        | 0.256   | 0.214   | 0.344   | 0.271  |
+| **v8-b**        | **event + event-VPR** | 0.299 | 0.368 | 0.493 | **0.387** |
+
+With no head at all, our backbone leads the best RGB backbone by **1.43x** (0.387 / 0.271).
+The full models, heads included, differ by **1.53x** (0.789 / 0.516 mean over the three
+Brisbane cells). So the descriptor head accounts for almost none of the gap: **the advantage
+is in the patch features.** That is the direct answer to the question as asked.
+
+Two supporting reads:
+* **It is not "more features detected".** Every backbone emits exactly the same 529 tokens
+  on the same frames; nothing is detected or missed. What differs is what those tokens
+  encode.
+* **The head is worth little, and it is the same head the baselines use.** Inside our own
+  family (v9 sweep, already trained), GeM -> SALAD is worth +0.039 on NYC, +0.007 on
+  Brisbane, +0.040 on Springfield, and training only the last four blocks recovers nearly
+  all of a full fine-tune (+0.001 on NYC, +0.008..+0.023 on Brisbane). Every architectural
+  effect inside our family is 0.001-0.040 — an order of magnitude below the feature-level
+  gap the probe measures.
+
+### 3. Which part of the training buys it
+
+Same probe, restricted to the **ViT-B row** so width is held fixed (all 768-d):
+
+| frozen ViT-B backbone | pretraining | VPR training      | mean R@1 |
+|-----------------------|-------------|-------------------|----------|
+| dinov2-b (reg4)       | RGB         | none              | 0.198    |
+| gept-b                | **event**   | none              | 0.214    |
+| salad                 | RGB         | RGB (GSV-Cities)  | 0.201    |
+| megaloc               | RGB         | RGB (large scale) | 0.271    |
+| **v8-b**              | **event**   | **event (I2E)**   | **0.387**|
+
+| step                                          | delta   | factor |
+|-----------------------------------------------|---------|--------|
+| event pretraining alone (dinov2-b -> gept-b)   | +0.016  | 1.08x  |
+| RGB VPR training, capacity-matched (-> salad)  | +0.003  | 1.01x  |
+| RGB VPR training, large scale (-> megaloc)     | +0.073  | 1.37x  |
+| event VPR training on top (gept-b -> v8-b)     | +0.173  | 1.81x  |
+| **total (dinov2-b -> v8-b)**                   | +0.189  | 1.95x  |
+
+In log terms the total splits **12% event pretraining / 88% event VPR training**.
+
+Three things follow, and they are the whole answer:
+
+1. **GEPT's event pretraining is not what does it.** On its own it is worth 1.08x — real,
+   but a twelfth of the effect. An RGB DINOv2 given large-scale *RGB* VPR training (megaloc,
+   1.37x) improves its event-frame patch features more than event pretraining does.
+2. **What does it is metric VPR training carried out on event frames.** 1.81x on top of the
+   event-pretrained init, and it is the same *kind* of intervention that buys megaloc its
+   1.37x — just performed in the target domain, where it is worth about 2.4x more.
+3. **SALAD is the control that makes this legible.** Capacity-matched to ours (same DINOv2
+   ViT-B/14 + SALAD, 88.0M) and VPR-trained, but on GSV-Cities photographs, its backbone is
+   statistically indistinguishable from stock DINOv2 on event frames (0.201 vs 0.198). The
+   architecture is not the variable; the training domain is.
+
+### 4. What was wrong with how the margin had been read
+
+Two defects, both fixed, neither large enough to change the conclusion above:
+
+* **Normalisation.** `--norm-stats` offered `imagenet` and `countmask` only, but v8 evaluates
+  on `accumulate` — a WHITE-background render that ImageNet centres **2.0-4.5 sigma** off
+  (R 4.47, G 2.00, B 3.71) and overscales up to 2.2x. All 119 baseline `*_accum_*` banks on
+  disk carry ImageNet constants. Fixed: `src/methods.py` gains `ACCUMULATE_MEAN/STD` read
+  from `b_v8_accum_s750.pt`'s own `config.tencode_mean/std` (the same gept `--compute-stats`
+  provenance as the countmask pair); `megaloc_transform` dispatches through `_NORM_STATS` and
+  rejects unknown names; `rgb_pooled.py` / `springfield_baselines.py` gain
+  `--norm-stats accumulate` with an `_acstats` tag and warn when stats and representation
+  disagree. Tests: `tests/test_eval_transform.py::ControlNormStatsTests`.
+  **Measured cost:** MegaLoc on the single-reference Brisbane cells, mean R@1
+  0.516 -> **0.527** (+0.011; daytime -0.043, morning +0.040, sunrise +0.035). On the frozen
+  backbone the matched stats *hurt* every RGB encoder (megaloc 0.271 -> 0.232) — the filters
+  expect ImageNet-normalised input, and only the trained head prefers the matched arm.
+* **Roster.** MegaLoc is 4th-5th on these cells; MixVPR and QAA set the bar. A margin quoted
+  against MegaLoc alone roughly doubles. `scripts/table_margin.py` reports the whole roster
+  and the error ratio.
+
+Still open, and both would only narrow the margin, never widen it: MixVPR's and QAA's own
+`_acstats` arms are not on disk, and Springfield has **MegaLoc as its only RGB control**
+(v8-B 0.3122 vs 0.2323) — mixvpr/qaa/boq/salad/supervlad are now wired into
+`scripts/springfield_baselines.py` but not yet run.
+
+### 5. What this does not say
+
+* The probe pools with a parameter-free mean, which is off-distribution for every trained
+  head; it measures what the tokens carry, not what each model's own head would extract.
+* Stride 5 shrinks the gallery, so its absolute R@1 is not a protocol number — only the arms
+  are comparable to each other.
+* "More features detected" was never a live option: every backbone emits the same 529 tokens
+  on the same frames. The question only has two answers, and the answer is the features.
+* No new training was run, so the crossed cell (RGB-DINOv2 init + our event recipe) is
+  untested; event pretraining and event VPR training are separated only at the frozen end.

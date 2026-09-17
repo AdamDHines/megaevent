@@ -168,13 +168,14 @@ def assert_filter_active(args, traverse, filter_dt_us, n_probe=12):
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
-def traverse_geometry(args, sequences, npz_root, aps_align=False):
+def traverse_geometry(args, sequences, npz_root, aps_align=False, align_sources=("aps",)):
     """{seq: (xy, covered, speed, info)} in one shared local ENU frame.
 
-    ``aps_align`` additionally drops every frame with no APS frame within half a slice. That
-    mask describes the *alignment* between the recorded and simulated arms, not the event
-    source, so it has to be applied to both or neither — masking only the synthetic arm would
-    score a real frame against a duplicated one and report the difference as a domain gap.
+    ``aps_align`` additionally drops every frame that any tree in ``align_sources`` marks
+    out_of_tolerance (no frame within half a slice). That mask describes the *alignment*
+    between the recorded and simulated arms, not the event source, so it has to be applied
+    to both or neither — masking only the synthetic arm would score a real frame against a
+    duplicated one and report the difference as a domain gap.
     """
     lat0, lon0 = tg.track_origin(args.eventlab_dir, args.dataset, sequences)
     print(f"  projection origin ({lat0:.6f}, {lon0:.6f})")
@@ -185,13 +186,16 @@ def traverse_geometry(args, sequences, npz_root, aps_align=False):
         info = geom[seq][3]
         if aps_align:
             xy, covered, speed, info = geom[seq]
-            aps = tnpz.aps_validity_mask(npz_root, args.dataset, seq, len(covered))
+            aps = tnpz.frame_validity_mask(npz_root, args.dataset, seq, len(covered),
+                                           sources=tuple(align_sources))
             dropped = int((covered & ~aps).sum())
             info = {**info, "aps_unaligned": dropped,
-                    "aps_unaligned_fraction": float(dropped / max(len(covered), 1))}
+                    "aps_unaligned_fraction": float(dropped / max(len(covered), 1)),
+                    "align_sources": list(align_sources)}
             geom[seq] = (xy, covered & aps, speed, info)
-            print(f"    {seq:9s} APS alignment drops {dropped} of {int(covered.sum())} "
-                  f"GPS-covered frames ({dropped / max(int(covered.sum()), 1):.1%})")
+            print(f"    {seq:9s} {'+'.join(align_sources)} alignment drops {dropped} of "
+                  f"{int(covered.sum())} GPS-covered frames "
+                  f"({dropped / max(int(covered.sum()), 1):.1%})")
         print(f"    {seq:9s} {info['n_frames']:6d} frames  {info['n_gps_fixes']:4d} GPS fixes  "
               f"{info['uncovered']:4d} outside GPS span  route {info['route_len_m']:.0f} m  "
               f"clock {info['clock_offset_s']:+.2f} s"
@@ -413,6 +417,12 @@ def main():
                     help="drop frames with no APS frame within half a slice. Implied by a "
                          "non-real --source, and available on `real` so the two arms of a "
                          "Sim2Real comparison are scored on exactly the same rows.")
+    ap.add_argument("--align-sources", nargs="+", default=None,
+                    help="frame trees whose select.json out_of_tolerance rows are OR-"
+                         "dropped when the alignment mask is on. Default: aps, plus gopro "
+                         "when --source i2e_gopro — that arm duplicates the video's first/"
+                         "last frame into every slice the video does not cover, and those "
+                         "rows must leave every arm of the comparison.")
     ap.add_argument("--eventlab-dir", default=DEFAULT_EVENTLAB)
     ap.add_argument("--npz-root", default=DEFAULT_NPZ_ROOT)
     ap.add_argument("--unfiltered-bank-dir", default=DEFAULT_UNFILTERED_BANKS)
@@ -443,6 +453,9 @@ def main():
                   f"activity denoising is meaningless on simulated events")
             cli.arms = ["off"]
         cli.aps_aligned = True
+    cli.align_sources = (tuple(cli.align_sources) if cli.align_sources
+                         else (("aps", "gopro") if cli.source == "i2e_gopro"
+                               else ("aps",)))
 
     args = _Args(cli.eventlab_dir, cli.dataset, cli.dt_ms, cli.no_hot_pixel, True,
                  source=cli.source, npz_root=cli.npz_root)
@@ -456,7 +469,8 @@ def main():
     print(f"  {cli.threshold_m:g} m radius, dt {cli.dt_ms} ms, {args.representation}, "
           f"hot-pixel {not cli.no_hot_pixel}, arms {cli.arms}")
 
-    geom = traverse_geometry(args, sequences, cli.npz_root, aps_align=cli.aps_aligned)
+    geom = traverse_geometry(args, sequences, cli.npz_root, aps_align=cli.aps_aligned,
+                             align_sources=cli.align_sources)
 
     all_results = {}
     for arm in cli.arms:
@@ -500,6 +514,7 @@ def main():
                 res["event_filter_dt_us"] = None if arm == "off" else cli.event_filter_dt_us
                 res["source"] = cli.source
                 res["aps_aligned"] = bool(cli.aps_aligned)
+                res["align_sources"] = list(cli.align_sources)
                 res["resolution"] = resolution
                 res["checkpoint"] = path
                 res["label"] = label
@@ -514,6 +529,7 @@ def main():
                                "threshold_m": cli.threshold_m, "dt_ms": cli.dt_ms,
                                "pca": [list(s) for s in cli.pca],
                                "source": cli.source, "aps_aligned": bool(cli.aps_aligned),
+                               "align_sources": list(cli.align_sources),
                                "hot_pixel": not cli.no_hot_pixel, "results": all_results},
                               handle, indent=2)
                 os.replace(tmp, out_json)           # a reader never sees a half-written file

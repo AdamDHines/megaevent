@@ -74,6 +74,13 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # controls" is a measurement rather than a debate. See megaloc_transform(stats=...).
 COUNTMASK_MEAN = (0.0975, 0.2804, 0.0977)
 COUNTMASK_STD = (0.1866, 0.4155, 0.1867)
+# The same quantity for `accumulate`, read from the v8 checkpoint that trains on it
+# (v8_bench/ckpts/b_v8_accum_s750.pt, config.tencode_mean/std — same gept --compute-stats
+# provenance as the countmask pair above). accumulate is a WHITE-background render, so
+# ImageNet stats sit 2.0-4.5 sigma off here (R 4.47, G 2.00, B 3.71) and overscale by up to
+# 2.2x — a worse mismatch than the ~2 sigma countmask case that cost MegaLoc 0.031 R@1.
+ACCUMULATE_MEAN = (0.952720206155105, 0.8816854731414574, 0.9289652490639286)
+ACCUMULATE_STD = (0.10467739838289758, 0.2129141097718445, 0.14082843440174486)
 # DINOv2-SALAD (Izquierdo & Civera, CVPR 2024) — megaevent's own architecture, RGB weights
 SALAD_HUB = "serizba/salad"
 SALAD_DIRNAME = "serizba_salad_main"        # torch.hub's checkout name for SALAD_HUB
@@ -218,6 +225,13 @@ class MegaEventMethod:
 # ---------------------------------------------------------------------------
 # 1b. megaloc — the RGB state of the art, unretrained, on the same frames
 # ---------------------------------------------------------------------------
+_NORM_STATS = {
+    "imagenet": (IMAGENET_MEAN, IMAGENET_STD),
+    "countmask": (COUNTMASK_MEAN, COUNTMASK_STD),
+    "accumulate": (ACCUMULATE_MEAN, ACCUMULATE_STD),
+}
+
+
 def megaloc_transform(resolution, stats="imagenet"):
     """countmask ``[3,H,W]`` already scaled to [0,1] -> the tensor MegaLoc expects.
 
@@ -227,11 +241,17 @@ def megaloc_transform(resolution, stats="imagenet"):
     same reason: each model keeps the preprocessing its own harness ships with, and the
     interpolation kernel is not what this comparison is about.
 
-    ``stats="countmask"`` swaps in the event-training statistics megaevent itself uses —
-    the fairness arm: banks built under it must carry a distinct tag, never the default one.
+    ``stats="countmask"`` / ``stats="accumulate"`` swap in the event-training statistics
+    megaevent itself uses for that representation — the fairness arm: banks built under
+    either must carry a distinct tag, never the default one. Pick the pair that matches the
+    representation being rendered; countmask stats on an accumulate frame are worse than
+    ImageNet, not better (black-bg constants on a white-bg render).
     """
-    mean, std = ((COUNTMASK_MEAN, COUNTMASK_STD) if stats == "countmask"
-                 else (IMAGENET_MEAN, IMAGENET_STD))
+    try:
+        mean, std = _NORM_STATS[stats]
+    except KeyError:
+        raise ValueError(f"unknown norm stats {stats!r}; "
+                         f"expected one of {sorted(_NORM_STATS)}") from None
     return transforms.Compose([
         transforms.Normalize(mean, std),
         transforms.Resize((resolution, resolution), antialias=True),

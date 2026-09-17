@@ -92,15 +92,17 @@ def main():
     # Real-vs-synthetic ablation: score a traverse from materialised .npz frames instead of
     # its own event stream, so the same traverse can be run twice from two event sources.
     parser.add_argument("--source", type=str, default=None,
-                        choices=["real", "i2e", "real_masked", "i2e_masked"],
+                        choices=["real", "i2e", "real_masked", "i2e_masked", "i2e_gopro"],
                         help="Score a traverse from pre-built .npz frames rather than the "
                              "HDF5 stream: 'real' is the recording's own event slices, "
                              "'i2e' is an I2E micro-saccade over the DAVIS APS frame from "
-                             "the same instant. The '_masked' variants drop the dead "
-                             "vignette, where I2E's log transform turns read noise into "
-                             "most of its events. Setting it also enables --method for a "
-                             "traverse dataset. Build them with scripts/dump_event_npz.py, "
-                             "scripts/extract_aps.py and scripts/mask_vignette.py.")
+                             "the same instant, 'i2e_gopro' the same saccade over the "
+                             "co-recorded 1920x1080 video frame from that instant. The "
+                             "'_masked' variants drop the dead vignette, where I2E's log "
+                             "transform turns read noise into most of its events. Setting "
+                             "it also enables --method for a traverse dataset. Build them "
+                             "with scripts/dump_event_npz.py, scripts/extract_aps.py, "
+                             "scripts/extract_gopro.py and scripts/mask_vignette.py.")
     parser.add_argument("--traverse-npz-root", type=str,
                         default="/media/adam/vprdatasets/megaevent/brisbane_npz",
                         help="Root of the per-source frame trees: "
@@ -170,6 +172,12 @@ def main():
     parser.add_argument("--match-filter", type=str, default="mutual",
                         choices=["mutual", "ratio"],
                         help="Keypoint correspondence filter before RANSAC.")
+    parser.add_argument("--no-pca", action="store_true",
+                        help="Report the native metric only, skipping PCA whitening entirely. "
+                             "For experiments that are native-only by design — the whitened "
+                             "cell measures the aggregator plus how well a 4096-d basis fits "
+                             "it, which is a second variable. Also skips the fit, the most "
+                             "memory-hungry step on a large gallery.")
     parser.add_argument("--no-extra-pca", action="store_true",
                         help="Report only the shared PCA power, skipping a method's extra "
                              "whitening exponents (Event-GeM's full-whitening pca1). Each one "

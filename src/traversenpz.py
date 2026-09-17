@@ -12,7 +12,9 @@ Layout, shared with :mod:`src.traversevpr`::
 
     <npz-root>/<dataset>/<source>/<seq>/frame_%06d.npz
 
-``source`` is one of ``real``, ``i2e``, ``real_masked``, ``i2e_masked``. Note that a ``real``
+``source`` is one of ``real``, ``i2e``, ``real_masked``, ``i2e_masked``, ``i2e_gopro``
+(the same I2E saccade over the co-recorded 1920x1080 video frame instead of the DAVIS APS
+frame). Note that a ``real``
 tree here is *not* interchangeable with the HDF5 path: only ``sunset1`` and ``sunset2`` were
 ever materialised to npz, and the pooled protocol needs all six traverses. Ask for
 ``source="real"`` and you get the HDF5 reader; the npz ``real`` tree is for the pairwise
@@ -31,11 +33,11 @@ import os
 import numpy as np
 from torch.utils.data import Dataset
 
-SOURCES = ("real", "i2e", "real_masked", "i2e_masked")
+SOURCES = ("real", "i2e", "real_masked", "i2e_masked", "i2e_gopro")
 # The arms whose events are simulated rather than recorded. Everything that is a property of
 # the sensor rather than of the scene -- hot-pixel removal, background-activity denoising --
 # is meaningless on these, because I2E has no read noise to remove.
-SYNTHETIC = ("i2e", "i2e_masked")
+SYNTHETIC = ("i2e", "i2e_masked", "i2e_gopro")
 
 
 def source_dir(npz_root, dataset, source, seq):
@@ -43,8 +45,9 @@ def source_dir(npz_root, dataset, source, seq):
     if not os.path.isdir(path):
         raise FileNotFoundError(
             f"no {source} arm for {seq} at {path}. Build it: scripts/extract_aps.py "
-            f"--seq {seq}, then I2E over <npz-root>/{dataset}/aps/{seq}, then "
-            f"scripts/mask_vignette.py for the masked arms.")
+            f"--seq {seq} (scripts/extract_gopro.py for i2e_gopro), then I2E over "
+            f"<npz-root>/{dataset}/<aps|gopro>/{seq}, then scripts/mask_vignette.py "
+            f"for the masked arms.")
     return path
 
 
@@ -63,36 +66,45 @@ def frame_paths(npz_root, dataset, source, seq):
     return paths
 
 
-def aps_validity_mask(npz_root, dataset, seq, n, strict=True):
-    """``[n]`` bool — False where this slice has no APS frame within half a slice.
+def frame_validity_mask(npz_root, dataset, seq, n, sources=("aps",), strict=True):
+    """``[n]`` bool — False where ANY listed frame tree marks the slice out_of_tolerance.
 
-    Read from the ``select.json`` that ``scripts/extract_aps.py`` writes. It describes the
-    *alignment*, not the event source, so it must be applied to whichever arm is scored:
-    dropping these frames from the synthetic arm alone would compare a real frame against a
-    duplicated one and report the difference as a domain gap.
+    Each ``source`` names a frame tree (``aps``, ``gopro``) whose extractor wrote a
+    ``select.json`` (``scripts/extract_aps.py`` / ``scripts/extract_gopro.py``, same
+    schema). A select report describes the *alignment*, not the event source, so the OR of
+    every tree in play must be applied to whichever arm is scored: dropping these frames
+    from the synthetic arm alone would compare a real frame against a duplicated one and
+    report the difference as a domain gap.
 
-    Both traverses that have been measured have only a handful, all at the ends — sunset1's
-    event stream starts 1.24 s before its first APS frame, sunset2's last slice runs 68 ms
-    past its last one.
+    The APS trees lose only a handful of slices at the ends. The gopro trees lose more:
+    the videos start after and end before the event streams, and every clamped slice is a
+    duplicate of the video's first or last frame.
     """
-    path = os.path.join(npz_root, dataset, "aps", seq, "select.json")
     keep = np.ones(n, dtype=bool)
-    if not os.path.exists(path):
-        if strict:
-            raise FileNotFoundError(
-                f"{path}: no APS selection report for {seq}. Without it the arms cannot be "
-                f"masked in step, so they are not comparable. Pass strict=False only for a "
-                f"real-arm run that is deliberately reproducing the unmasked numbers.")
-        return keep
-    with open(path) as handle:
-        report = json.load(handle)
-    if int(report.get("n_slices", n)) != n:
-        raise ValueError(
-            f"{path} was written for {report.get('n_slices')} slices but {seq} has {n} "
-            f"frames — the arms would be scored on different grids")
-    bad = np.asarray(report.get("out_of_tolerance", []), dtype=int)
-    keep[bad[bad < n]] = False
+    for source in sources:
+        path = os.path.join(npz_root, dataset, source, seq, "select.json")
+        if not os.path.exists(path):
+            if strict:
+                raise FileNotFoundError(
+                    f"{path}: no {source} selection report for {seq}. Without it the arms "
+                    f"cannot be masked in step, so they are not comparable. Pass "
+                    f"strict=False only for a real-arm run that is deliberately "
+                    f"reproducing the unmasked numbers.")
+            continue
+        with open(path) as handle:
+            report = json.load(handle)
+        if int(report.get("n_slices", n)) != n:
+            raise ValueError(
+                f"{path} was written for {report.get('n_slices')} slices but {seq} has "
+                f"{n} frames — the arms would be scored on different grids")
+        bad = np.asarray(report.get("out_of_tolerance", []), dtype=int)
+        keep[bad[bad < n]] = False
     return keep
+
+
+def aps_validity_mask(npz_root, dataset, seq, n, strict=True):
+    """``[n]`` bool — False where this slice has no APS frame within half a slice."""
+    return frame_validity_mask(npz_root, dataset, seq, n, ("aps",), strict)
 
 
 class NpzTraverseDataset(Dataset):

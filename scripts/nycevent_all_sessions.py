@@ -21,6 +21,7 @@ into the full 55,433 samples and re-partitioned by session, so nothing is re-ext
 """
 
 import csv
+import glob
 import json
 import os
 import sys
@@ -59,6 +60,28 @@ MODELS = [
     # via the parity-checked nyc_extract.py driver in the 0.1.0 worktree)
     ("Event-GeM 0.1.0 (global)",     f"{EVAL}/nycevent", "eg010_gem224", 0.4354),
 ]
+
+# v9 arch-ablation arms ({ViT-S,ViT-B} x {ft4,full} x {GeM,SALAD} plus the N sweep, all
+# accumulate @ step2000). Discovered by glob rather than hardcoded: the tag embeds the
+# checkpoint sha, which is not known until the wave is synced off the HPC. The step in the tag
+# is left as a wildcard on purpose — it comes from ck["step"], which is 0-indexed, so the
+# step2000.pt milestone tags itself `_s1999_`. Two matches means two shas for one arm, which
+# is a stale bank rather than something to guess between, so it raises. A `None` in the
+# reported slot means "no published random-split number to check against" — these arms are
+# new, so the reproduction cross-check below is skipped for them (their random-split R@1 is
+# still computed and printed, it just has nothing to be compared with).
+V9_ARMS = ["s_gem_ft4", "s_gem_full", "b_gem_ft4", "b_gem_full",
+           "s_salad_ft4", "s_salad_full", "b_salad_ft4", "b_salad_full",
+           "b_salad_full_P32", "b_salad_full_P48"]
+for _arm in V9_ARMS:
+    _hits = sorted(glob.glob(
+        f"{EVAL}/nycevent/{_arm}_s*_accumulate_r322_database.npy"))
+    if len(_hits) > 1:
+        raise SystemExit(f"v9 {_arm}: {len(_hits)} banks match, sha is ambiguous —\n  "
+                         + "\n  ".join(os.path.basename(h) for h in _hits))
+    if _hits:
+        _tag = os.path.basename(_hits[0])[:-len("_database.npy")]
+        MODELS.append((f"v9 {_arm}", f"{EVAL}/nycevent", _tag, None))
 
 
 def load_full(bank_dir, tag):
@@ -130,7 +153,7 @@ def main():
         ranked = bp.topk_ranked(db, qd, device, chunk=256, db_chunk=40000)
         rec, _, _ = bp.recall_from_ranked(ranked, split_gt)
         reproduced[name] = rec[1]
-        if abs(rec[1] - rep) > 1e-3:                    # rep is a 3 dp transcription
+        if rep is not None and abs(rec[1] - rep) > 1e-3:  # rep is a 3 dp transcription
             print(f"  WARNING {name}: random-split R@1 {rec[1]:.4f} != reported {rep:.3f}",
                   flush=True)
         del db, qd, ranked
@@ -156,7 +179,12 @@ def main():
         for name, _, _, rep in MODELS:
             vals = [table[(s, name)] for s in scored_sessions]
             m = sum(vals) / len(vals)
-            tail = f"      {rep:.3f}   ({m - rep:+.3f})" if title == "R@1" else ""
+            if title != "R@1":
+                tail = ""
+            elif rep is None:                      # new arm: nothing published to compare to
+                tail = f"      {reproduced[name]:.3f}   (this run)"
+            else:
+                tail = f"      {rep:.3f}   ({m - rep:+.3f})"
             print(f"  {name:31s}{m:>8.3f}{min(vals):>8.3f}{max(vals):>8.3f}{tail}")
 
     print("\n\nPer-session R@1\n")

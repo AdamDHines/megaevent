@@ -181,7 +181,8 @@ def run(args):
             db_desc, q_desc = method.encode(db_frames), method.encode(q_frames)
             seed_res = {"recall": {}, "recall_curve": {}}
             native, pca_out = _score_both(method, db_desc, q_desc, gt, device,
-                                          seed_res, {}, label=f"seed{seed}_")
+                                          seed_res, {}, label=f"seed{seed}_",
+                                          skip_pca=getattr(args, "no_pca", False))
             per_seed.append({t.replace(f"seed{seed}_", ""): v
                              for t, v in seed_res["recall"].items()})
             results["recall_curve"][f"seed{seed}"] = {
@@ -189,13 +190,14 @@ def run(args):
                 for t, c in seed_res["recall_curve"].items()}
             if keep is None:            # figures describe the first seed
                 keep = pca_out
-                curves["native"] = {int(n): v for n, v in
-                                    seed_res["recall_curve"][f"seed{seed}_native"].items()}
-                curves["pca"] = {int(n): v for n, v in
-                                 seed_res["recall_curve"][f"seed{seed}_pca"].items()}
+                for space in ("native", "pca"):
+                    # --no-pca leaves only the native curve to describe.
+                    curve = seed_res["recall_curve"].get(f"seed{seed}_{space}")
+                    if curve is not None:
+                        curves[space] = {int(n): v for n, v in curve.items()}
         results["recall"] = _seed_summary(per_seed)
         results["seeds"] = list(args.seeds)
-        for tag in ("native", "pca"):
+        for tag in [t for t in ("native", "pca") if t in results["recall"]]:
             m = results["recall"][tag]
             logger.info(f"[{method.name} {tag}] " + "  ".join(
                 f"R@{k}={m[str(k)]['mean']:.3f}+-{m[str(k)]['std']:.3f}" for k in KS)
@@ -217,7 +219,8 @@ def run(args):
             return
         native, pca_out = _score_both(
             method, db_desc, q_desc, gt, device, results, curves,
-            paths=(db_paths, q_paths), map_ks=KS if args.dataset == "msls" else ())
+            paths=(db_paths, q_paths), map_ks=KS if args.dataset == "msls" else (),
+            skip_pca=getattr(args, "no_pca", False))
         np.save(os.path.join(out_dir, f"sim_{method.tag}_{args.ref}_{args.query}{suffix}.npy"),
                 native[4])
         rec, curve, ranked, mask, sim = pca_out

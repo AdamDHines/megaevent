@@ -297,6 +297,9 @@ def main():
                   help="drop frames with no APS frame within half a slice. "
                        "Implied by a non-real --source; pass it on `real` so "
                        "both arms of a Sim2Real pair score the same rows.")
+    ap.add_argument("--align-sources", nargs="+", default=None,
+                    help="frame trees whose select.json rows are OR-dropped by the "
+                         "alignment mask; default aps, plus gopro for i2e_gopro")
     ap.add_argument("--eventlab-dir", default=None)
     ap.add_argument("--npz-root", default=None)
     ap.add_argument("--out-dir", default=DEFAULT_OUT)
@@ -331,6 +334,9 @@ def main():
             cli.arms = ["off"]
         if cli.dataset != "brisbane_event":
             raise SystemExit(f"--source {cli.source} exists only for brisbane_event")
+    cli.align_sources = (tuple(cli.align_sources) if cli.align_sources
+                         else (("aps", "gopro") if cli.source == "i2e_gopro"
+                               else ("aps",)))
 
     args = _Args(cli.eventlab_dir, cli.dataset, cli.dt_ms, cli.no_hot_pixel, True,
                  source=cli.source, npz_root=cli.npz_root)
@@ -349,7 +355,9 @@ def main():
         root = os.path.join(cli.eventlab_dir, cli.dataset)
         geom = npl.traverse_geometry(root, sequences, cli.dt_ms)
     else:
-        geom = bp.traverse_geometry(args, sequences, cli.npz_root, aps_align=(synthetic or cli.aps_aligned))
+        geom = bp.traverse_geometry(args, sequences, cli.npz_root,
+                                    aps_align=(synthetic or cli.aps_aligned),
+                                    align_sources=cli.align_sources)
 
     all_results = {}
     for arm in cli.arms:

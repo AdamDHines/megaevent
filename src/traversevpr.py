@@ -56,12 +56,13 @@ from src.scoring import (
     cached_array, evaluate, figure_recall_curve, figure_retrievals, score_both, seed_summary,
 )
 
-SOURCES = ("real", "i2e", "real_masked", "i2e_masked")
+SOURCES = ("real", "i2e", "real_masked", "i2e_masked", "i2e_gopro")
 SOURCE_BLURB = {
     "real": "real events",
     "i2e": "I2E events from the DAVIS frames",
     "real_masked": "real events, vignette masked",
     "i2e_masked": "I2E events from the DAVIS frames, vignette masked",
+    "i2e_gopro": "I2E events from the co-recorded video frames",
 }
 
 

@@ -168,8 +168,11 @@ def select_and_write(bag_path, out_dir, centres, dt_ms):
     return times, times - centres, written
 
 
-def aps_quality(out_dir, n_slices, n_sample=200):
+def aps_quality(out_dir, n_slices, n_sample=200, ext=".png"):
     """Exposure and sharpness statistics over a sample of the written frames.
+
+    Shared with ``scripts/extract_gopro.py`` -- hence ``ext`` -- so the video arm's exposure
+    lands in the same fields as the APS arm's and the two are directly comparable.
 
     Both available bags are dusk traverses, the worst case for a DAVIS346's APS. If the
     baselines drop on the synthetic arm, "the frames were under-exposed at sunset" is a
@@ -182,7 +185,7 @@ def aps_quality(out_dir, n_slices, n_sample=200):
     idx = np.linspace(0, n_slices - 1, min(n_sample, n_slices)).astype(int)
     means, dark, bright, sharp = [], [], [], []
     for i in idx:
-        img = cv2.imread(os.path.join(out_dir, f"frame_{i:06d}.png"), cv2.IMREAD_GRAYSCALE)
+        img = cv2.imread(os.path.join(out_dir, f"frame_{i:06d}{ext}"), cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
         means.append(img.mean())

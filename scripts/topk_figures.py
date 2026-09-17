@@ -37,6 +37,14 @@ Nothing that decides a number is re-implemented. Image datasets come from
 ``brisbane_pooled.topk_ranked``. R@1..R@k over the whole query set is printed for every run,
 because a stale or misaligned bank produces a perfectly plausible-looking figure and an
 obviously wrong recall.
+
+``springfield_event`` is the third kind, and it is not ranked here at all: each query's top-20
+is read from the dump ``scripts/springfield_diag.py --stage dump`` wrote — the ranking behind
+the published number, whose R@1 is checked against the results JSON before anything is drawn.
+Re-ranking would mean the 132,569 x 8448 pooled bank and a 2 GB ground-truth matrix, to draw
+fifteen queries. ``--sweeps day dawn`` restricts the mined pools (and their quantile cuts) to
+the daylight conditions; night is an appearance failure for every model and is reported as
+numbers, not panels.
 """
 
 import argparse
@@ -60,8 +68,9 @@ sys.path.insert(0, HERE)
 from src.inference import C_FP, C_MUTED, C_TEXT, C_TP  # noqa: E402
 from src.methods import get_method  # noqa: E402
 from src.scoring import cached_array  # noqa: E402
-from brisbane_pooled import recall_from_ranked, topk_ranked  # noqa: E402
-from figure_frames import DATA_ROOT, load_image_benchmark, load_pooled_benchmark  # noqa: E402
+from brisbane_pooled import topk_ranked  # noqa: E402
+from figure_frames import (DATA_ROOT, load_image_benchmark, load_pooled_benchmark,  # noqa: E402
+                           load_springfield_benchmark)
 
 DEFAULT_CKPT = os.path.join(REPO, "ckpts", "megaevent_vitb_mloc.pt")
 CASES = ("random", "easy", "hard", "nearmiss", "impossible")
@@ -100,9 +109,23 @@ BENCHMARKS = {
               "representation": "accumulate",
               "bank_dir": f"{DATA_ROOT}/v8_bench/nsavp",
               "bank_tag": "r322ba50", "bank_label": "v8"},
+    # The full Springfield capture (memory springfield-full-eval): the same v8-B accumulate
+    # model, BA-off, ranked once by springfield_diag's dump stage. `results` names the run,
+    # `dump` its ranking; both are overridable together (--results/--dump) for the BA-on arm
+    # or the ViT-S dump.
+    "springfield_event": {
+        "kind": "springfield", "representation": "accumulate",
+        "root": "/media/adam/vprdatasets/megaevent/springfield/sessions",
+        "bank_dir": f"{DATA_ROOT}/evaluations/springfield",
+        "results": os.path.join(REPO, "output", "springfield_full",
+                                "results_b_v8_accum_s750_s750_3f4eb54780_accumulate_r322"
+                                "_hp1_baoff.json"),
+        "dump": os.path.join(REPO, "output", "springfield_diag",
+                             "dump_b_v8_accum_s750_s750_3f4eb54780_accumulate_r322"
+                             "_hp1_baoff.npz")},
 }
-# `pitts` is same-panorama retrieval rather than a tab:native row, so it is reachable by name
-# but not swept by `-d all`.
+# `pitts` is same-panorama retrieval rather than a tab:native row, and `springfield_event` is
+# not in that table yet, so both are reachable by name but not swept by `-d all`.
 ALL = ("tokyo247", "msls", "pitts250k", "nycevent", "brisbane_event", "nsavp")
 
 
@@ -178,7 +201,7 @@ def top1_distances(bench, rows):
     means for each case, rather than a subtraction of two incomparable eastings deciding it
     for them.
     """
-    n_q = bench.gt.shape[1]
+    n_q = bench.shape[1]
     if bench.db_xy is None or bench.q_xy is None:
         return np.full(n_q, np.nan)
     d = np.linalg.norm(bench.db_xy[rows] - bench.q_xy, axis=1)
@@ -188,10 +211,21 @@ def top1_distances(bench, rows):
     return d
 
 
-def query_stats(bench, ranked, scores, topk):
-    """Per-query facts the case rules are written in terms of."""
-    gt, n_q = bench.gt, bench.gt.shape[1]
-    hit = gt[ranked, np.arange(n_q)[None, :]]               # [depth, n_q] bool
+def recall_from_hit(hit, scorable, ks):
+    """``({k: R@k}, {n: R@n})`` over the ``scorable`` query indices.
+
+    ``brisbane_pooled.recall_from_ranked``'s arithmetic, on the hit matrix
+    :meth:`Benchmark.hit` returns — so a benchmark with no dense ground truth scores by the
+    same rule as one with.
+    """
+    found = np.cumsum(hit, axis=0) > 0
+    curve = {n: float(found[n - 1, scorable].mean()) for n in range(1, hit.shape[0] + 1)}
+    return {k: curve[k] for k in ks}, curve
+
+
+def query_stats(bench, hit, ranked, scores, topk):
+    """Per-query facts the case rules are written in terms of. ``hit`` is ``bench.hit(ranked)``."""
+    n_q = hit.shape[1]
     any_hit = hit.any(axis=0)
     # -1 for "no positive anywhere in the mined depth", which is what `impossible` is about.
     first_correct = np.where(any_hit, hit.argmax(axis=0), -1)
@@ -238,7 +272,7 @@ def nearest_positive(bench, q):
     The answer that *was* available. Without it a reader has to take "there was nothing to
     retrieve" on trust; with it they can look at the frame and see it.
     """
-    positives = np.flatnonzero(bench.gt[:, q])
+    positives = bench.positives(q)
     if not positives.size:
         return None, None
     if bench.db_xy is None or bench.q_xy is None:
@@ -276,7 +310,8 @@ def figure_montage(bench, entries, out_png, topk, dpi, case):
     for r, entry in enumerate(entries):
         q = entry["query_index"]
         panel(axes[r][0], bench.q_frames.render(q), "query" if r == 0 else None, C_MUTED, 1.2)
-        axes[r][0].set_ylabel(f"q{q}", fontsize=7.5, color=C_MUTED)
+        caption = getattr(bench.q_frames, "caption", None)
+        axes[r][0].set_ylabel(caption(q) if caption else f"q{q}", fontsize=7.5, color=C_MUTED)
         for c, item in enumerate(entry["retrievals"]):
             colour = C_TP if item["correct"] else C_FP
             distance = "" if item["distance_m"] is None else f"\n{item['distance_m']:.0f} m"
@@ -301,7 +336,7 @@ def figure_montage(bench, entries, out_png, topk, dpi, case):
 # ---------------------------------------------------------------------------
 # 4. One dataset
 # ---------------------------------------------------------------------------
-def write_case(bench, case, picks, ranked, scores, stats, out_dir, cli, sims_for):
+def write_case(bench, case, picks, ranked, scores, stats, out_dir, cli):
     """Write every sampled query of one case, and return its manifest entries."""
     case_dir = os.path.join(out_dir, case)
     os.makedirs(case_dir, exist_ok=True)
@@ -315,7 +350,7 @@ def write_case(bench, case, picks, ranked, scores, stats, out_dir, cli, sims_for
         retrievals = []
         for rank in range(cli.topk):
             db_i = int(ranked[rank, q])
-            ok = bool(bench.gt[db_i, q])
+            ok = bench.correct(db_i, q)
             name = f"top{rank + 1}_{'correct' if ok else 'wrong'}_db{db_i:06d}.png"
             mpimg.imsave(os.path.join(q_dir, name), bench.db_frames.render(db_i))
             retrievals.append({"rank": rank + 1, "database_index": db_i,
@@ -325,7 +360,7 @@ def write_case(bench, case, picks, ranked, scores, stats, out_dir, cli, sims_for
                                **bench.db_frames.provenance(db_i)})
 
         entry = {"case": case, "query_index": q, "query_key": bench.q_frames.key(q),
-                 "n_positives": int(bench.gt[:, q].sum()),
+                 "n_positives": int(len(bench.positives(q))),
                  "first_correct_rank": (None if stats["first_correct"][q] < 0
                                         else int(stats["first_correct"][q]) + 1),
                  "top1_distance_m": (None if np.isnan(stats["d1"][q])
@@ -334,6 +369,11 @@ def write_case(bench, case, picks, ranked, scores, stats, out_dir, cli, sims_for
                  "margin_to_top2": float(stats["margin"][q]),
                  "directory": os.path.relpath(q_dir, cli.out_dir),
                  "retrievals": retrievals, **bench.q_frames.provenance(q)}
+        # Springfield's dump knows the best-correct row's exact rank over the whole gallery —
+        # the caption fact behind an `impossible` panel ("the correct frame sat at rank 718").
+        for field, values in bench.extra.items():
+            value = values[q]
+            entry[field] = int(value) if np.issubdtype(values.dtype, np.integer) else float(value)
 
         if cli.gt_column:
             db_i, distance = nearest_positive(bench, q)
@@ -342,7 +382,8 @@ def write_case(bench, case, picks, ranked, scores, stats, out_dir, cli, sims_for
                 mpimg.imsave(os.path.join(q_dir, name), bench.db_frames.render(db_i))
                 entry["nearest_positive"] = {
                     "database_index": db_i, "database_key": bench.db_frames.key(db_i),
-                    "distance_m": distance, "similarity": sims_for(db_i, q), "image": name,
+                    "distance_m": distance, "similarity": bench.similarity(db_i, q),
+                    "image": name,
                     **bench.db_frames.provenance(db_i)}
         entries.append(entry)
 
@@ -366,6 +407,9 @@ def run_dataset(cli, name, device):
     if spec["kind"] == "image":
         dataset, banks, meta = image_banks(cli, spec, device)
         bench = load_image_benchmark(cli, dataset, banks)
+    elif spec["kind"] == "springfield":
+        bench = load_springfield_benchmark(cli, spec)
+        meta = {"native_metric": "cosine"}
     else:
         cli.query = cli.query_traverse or spec["query"]
         cli.database = cli.database_traverses or list(spec["database"])
@@ -377,31 +421,62 @@ def run_dataset(cli, name, device):
     # `groups` is a pair of string arrays used only by Benchmark.distance; it is not JSON.
     meta.pop("groups", None)
 
-    n_db, n_q = bench.gt.shape
-    scorable = np.flatnonzero(bench.gt.sum(0) > 0)
+    n_db, n_q = bench.shape
+    scorable = np.flatnonzero(bench.n_positives_all() > 0)
     print(f"  {n_db} database x {n_q} queries, {len(scorable)} scorable "
           f"@ {bench.threshold_m:g} m")
     if cli.topk > n_db:
         raise SystemExit(f"--topk {cli.topk} exceeds the {n_db}-image database")
 
     depth = max(cli.mine_depth, cli.topk + 1)
-    ranked, scores = topk_ranked(bench.db, bench.queries, device, k=min(depth, n_db),
-                                 chunk=cli.score_chunk, db_chunk=cli.db_chunk,
-                                 return_scores=True)
+    if bench.ranking is not None:
+        ranked, scores = bench.ranking
+        if depth > ranked.shape[0]:
+            raise SystemExit(f"--mine-depth {cli.mine_depth}: the precomputed ranking holds "
+                             f"{ranked.shape[0]} rows per query — re-run "
+                             f"scripts/springfield_diag.py --stage dump with a larger K")
+        ranked, scores = ranked[:depth], scores[:depth]
+    else:
+        ranked, scores = topk_ranked(bench.db, bench.queries, device, k=min(depth, n_db),
+                                     chunk=cli.score_chunk, db_chunk=cli.db_chunk,
+                                     return_scores=True)
+    hit = bench.hit(ranked)
     ks = tuple(range(1, cli.topk + 1))
-    recall, curve, _ = recall_from_ranked(ranked, bench.gt, ks=ks)
+    recall, curve = recall_from_hit(hit, scorable, ks)
     print("  over all scorable queries: " + "  ".join(f"R@{k}={recall[k]:.4f}" for k in ks)
           + f"   R@{len(curve)}={curve[len(curve)]:.4f}")
+    # A precomputed ranking is only as good as its provenance: the dump must reproduce the
+    # number the results JSON published, or it is some other run's ranking.
+    published = bench.meta.get("published_r1")
+    if published is not None:
+        if abs(recall[1] - published) > 1e-4:
+            raise SystemExit(f"R@1 {recall[1]:.6f} from the ranking dump against "
+                             f"{published:.6f} in the results JSON — not the same run")
+        print(f"  matches the results JSON's R@1 {published:.4f}")
 
-    stats = query_stats(bench, ranked, scores, cli.topk)
-    pools = mine(bench, stats, scorable, cli)
+    # An optional query selection (Springfield's day/dawn/night). The pools, and the quantile
+    # cuts inside them, are mined over the selection; the recall above is still the whole set.
+    selection, selection_meta = scorable, None
+    if cli.sweeps:
+        if bench.q_labels is None:
+            raise SystemExit(f"--sweeps: {name} carries no per-query condition labels")
+        known = sorted(set(map(str, np.unique(bench.q_labels))))
+        unknown = [s for s in cli.sweeps if s not in known]
+        if unknown:
+            raise SystemExit(f"--sweeps {unknown[0]}: {name}'s conditions are {known}")
+        chosen = np.isin(bench.q_labels, cli.sweeps)
+        selection = scorable[chosen[scorable]]
+        sel_recall, _ = recall_from_hit(hit, selection, ks)
+        print(f"  --sweeps {' '.join(cli.sweeps)}: {len(selection)} queries, "
+              + "  ".join(f"R@{k}={sel_recall[k]:.4f}" for k in ks))
+        selection_meta = {"sweeps": list(cli.sweeps), "n_queries": int(len(selection)),
+                          "recall": {str(k): sel_recall[k] for k in ks}}
+
+    stats = query_stats(bench, hit, ranked, scores, cli.topk)
+    pools = mine(bench, stats, selection, cli)
     rng = np.random.default_rng(cli.seed)
     out_dir = os.path.join(cli.out_dir, name, cli.tag)
     os.makedirs(out_dir, exist_ok=True)
-
-    def sims_for(db_i, q):
-        """Cosine between one database row and one query — both banks are L2-normalised."""
-        return float(bench.db[db_i].to(torch.float32) @ bench.queries[q].to(torch.float32))
 
     sampled, pool_sizes = {}, {}
     for case in cli.cases:
@@ -412,8 +487,7 @@ def run_dataset(cli, name, device):
             continue
         take = min(cli.per_case, pool.size)
         picks = np.sort(rng.choice(pool, size=take, replace=False))
-        sampled[case] = write_case(bench, case, picks, ranked, scores, stats, out_dir, cli,
-                                   sims_for)
+        sampled[case] = write_case(bench, case, picks, ranked, scores, stats, out_dir, cli)
         hits = sum(1 for e in sampled[case] if e["retrievals"][0]["correct"])
         print(f"  {case:11s} pool {pool.size:6d}  drew {[int(p) for p in picks]}  "
               f"{hits}/{take} correct at top-1")
@@ -428,6 +502,7 @@ def run_dataset(cli, name, device):
                                "impossible_min_m": cli.far_min * bench.threshold_m,
                                "impossible_quantile": cli.impossible_quantile},
                 "recall_all_queries": {str(k): recall[k] for k in ks},
+                "query_selection": selection_meta,
                 "case_pool_sizes": pool_sizes, "sampled": sampled}
     with open(os.path.join(out_dir, "manifest.json"), "w") as handle:
         json.dump(manifest, handle, indent=2)
@@ -491,6 +566,14 @@ def main():
                     help="override the registry's per-dataset representation (which "
                          "matches what each bank was extracted with) — figures render "
                          "frames in this representation")
+    ap.add_argument("--sweeps", nargs="+", default=None,
+                    help="springfield_event: draw every case from these query conditions only "
+                         "(day dawn night). The whole-set recall is still printed and checked.")
+    ap.add_argument("--results", default=None,
+                    help="springfield_event: a springfield_full results JSON to draw instead of "
+                         "the registry's (e.g. the _ba50 arm); goes with --dump")
+    ap.add_argument("--dump", default=None,
+                    help="springfield_event: the matching springfield_diag dump_<tag>.npz")
     ap.add_argument("--dt-ms", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=None,
                     help="frames per forward pass during extraction (default 64). Memory "
@@ -512,10 +595,14 @@ def main():
         raise SystemExit("--per-case and --topk must both be at least 1")
     if bool(cli.db_bank) != bool(cli.query_bank):
         raise SystemExit("--db-bank and --query-bank go together")
-    overrides = (cli.db_bank, cli.query_traverse, cli.database_traverses, cli.bank_dir_override)
+    if bool(cli.dump) != bool(cli.results):
+        raise SystemExit("--dump and --results go together")
+    overrides = (cli.db_bank, cli.query_traverse, cli.database_traverses, cli.bank_dir_override,
+                 cli.sweeps, cli.dump)
     if len(names) > 1 and any(overrides):
         raise SystemExit("per-dataset overrides (--db-bank, --query-traverse, --database, "
-                         "--bank-dir) apply to one dataset — name it explicitly")
+                         "--bank-dir, --sweeps, --dump/--results) apply to one dataset — name "
+                         "it explicitly")
     # Ordered as the user asked for them, so a montage's rows read in a fixed order.
     cli.cases = [c for c in CASES if c in cli.cases]
 
