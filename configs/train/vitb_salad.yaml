@@ -1,0 +1,33 @@
+# GEPT e9fdccc/run_v8.sh, base arm. Paths are supplied on the CLI.
+vit: base
+representation: accumulate
+force_ext: .png
+streams: [sf_xl_frontal, sf_xl_lateral, gsv_cities, msls, megascenes, scannet]
+msls_val_cities: [cph, sf]
+compute_stats: true
+aggregator: salad
+n_trainable_blocks: 12
+encoder_lr_mult: 0.1
+layerwise_lr_decay: null
+lr: 0.00005
+P_places: 64
+grad_checkpoint: true
+steps: 2000
+warmup_steps: 500
+ms_alpha: 1.0
+ms_base: 0.0
+fp32_loss: true
+aug_domain_rand: true
+aug_dropout_max: 0.8
+aug_salt_prob: 0.02
+aug_hflip: false
+scannet_chunk: 32
+salad_proj: true
+salad_init: megaloc
+eval_img_size: 322
+eval_pooled: true
+eval_stride: 5
+eval_every: 250
+save_every: 500
+eval_pca: false
+run_name: b_v8_accum

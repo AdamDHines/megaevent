@@ -1,0 +1,14 @@
+{
+  "megaevent_vits14": {
+    "repo_id": "AdamHines/megaevent",
+    "filename": "megaevent_vits14.pt",
+    "revision": "fd727196d45ce770f342083b43ec6affdd8bf013",
+    "eval_resolution": 322
+  },
+  "megaevent_vitb14": {
+    "repo_id": "AdamHines/megaevent",
+    "filename": "megaevent_vitb14.pt",
+    "revision": "fd727196d45ce770f342083b43ec6affdd8bf013",
+    "eval_resolution": 322
+  }
+}

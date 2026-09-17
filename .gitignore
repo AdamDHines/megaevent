@@ -4,7 +4,6 @@ __pycache__/
 *$py.class
 logs/
 springfield-event/
-docs/
 # C extensions
 *.so
 
@@ -233,3 +232,11 @@ SpikeVPR/
 pittsinfo/
 envs/
 trained_models/
+results/
+runs/
+data/
+*.safetensors
+src/ckpts/
+src/data/
+results/
+*.Ds_Store
