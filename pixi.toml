@@ -49,4 +49,5 @@ pytorch-gpu = "*"
 pytorch = "*"
 
 [tasks]
-megaevent = "python -m megaevent"
+megaevent = { cmd = "python -m megaevent", env = { PYTHONPATH = "src" } }
+test = "pytest"
