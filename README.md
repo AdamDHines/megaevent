@@ -2,6 +2,12 @@
 
 This repository contains the evaluation and training code for MegaEvent, our state-of-the-art visual place recognition system for event cameras.
 
+<p align="center">
+<img src="assets/megaevent.png" width="1200">
+</p>
+
+[ArXiv Paper]() &bull; [Pre-trained models](https://huggingface.co/AdamHines/megaevent) &bull; [Springfield-Event-VPR dataset](https://huggingface.co/datasets/AdamHines/springfield-event-vpr)
+
 ## Install
 
 Install [Pixi](https://pixi.sh), clone this repository, then run:
@@ -10,12 +16,9 @@ Install [Pixi](https://pixi.sh), clone this repository, then run:
 pixi install
 ```
 
-Linux and Windows use CUDA 12.8; Apple Silicon uses MPS when available, otherwise CPU.
-While the models are private, authenticate an account with repository access:
+Linux and Windows resolve a CUDA 12 build of PyTorch; Apple Silicon uses MPS when
+available, otherwise CPU. Run the test suite with `pixi run test`.
 
-```sh
-pixi run hf auth login
-```
 
 ## Retrieve
 
@@ -24,8 +27,10 @@ pixi run megaevent retrieve --reference reference.h5 --query query.h5 --top-k 5 
 ```
 
 EventCV reads the event files. A file is sliced into 50 ms windows (`--window-ms`);
-a directory supplies one sample per event file. Results include matches and scores
-in `retrievals.csv`. Add `--save-previews 10` for retrieval images.
+a directory supplies one sample per event file. `--output` receives `retrievals.csv`
+with `query_id,reference_id,rank,score`, alongside `samples.json` and `run.json`
+describing the windows and the settings used. Add `--save-previews 10` to also write
+match images for ten sampled queries into `previews/`.
 
 ## Evaluate
 
@@ -33,19 +38,24 @@ in `retrievals.csv`. Add `--save-previews 10` for retrieval images.
 pixi run megaevent retrieve --reference reference.h5 --query query.h5 --ground-truth positives.npy --output results
 ```
 
-Ground truth is a boolean `[reference, query]` matrix aligned to the windows, or
-a CSV with `query_id,reference_id` columns. Evaluation adds Recall@1/5/10/20.
-See [input options](docs/inputs.md) for timestamps, sensor sizes and alignment.
+Ground truth is a boolean `[reference, query]` matrix aligned to the windows, or a
+CSV with `query_id,reference_id` columns; pass `--gt-layout query-reference` for the
+transposed matrix. Evaluation adds Recall@1/5/10/20 and writes `metrics.json`.
 
-## Models and Training
+## Models
 
-`--model megaevent_vits14` (default) or `--model megaevent_vitb14` downloads and
-caches weights into `src/ckpts` from [AdamHines/megaevent](https://huggingface.co/AdamHines/megaevent).
-Use `--checkpoint model.pt` for local weights, or `--offline` for cached models.
+Retrieval downloads the weights it needs on the first run, so there is no separate
+download step. `--model megaevent_vits14` (default) or `--model megaevent_vitb14`
+fetches a pinned revision from
+[AdamHines/megaevent](https://huggingface.co/AdamHines/megaevent) and caches it in
+`src/ckpts`; later runs reuse the cached file.
 
-```sh
-pixi run -e train megaevent train --smoke --device cpu
+Training code lives in `src/megaevent/training` with recipes in `configs/train/`, and
+is not documented yet.
+
+## Citation
+If you use our work, please cite the following paper:
+
+```bibtex
+
 ```
-
-The original v8 small/base recipes are in `configs/train/`.
-See [training](docs/training.md) for data and initialization paths.

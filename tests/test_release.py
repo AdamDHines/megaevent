@@ -78,9 +78,16 @@ def test_topk_chunking_ties_and_small_gallery():
     qry /= np.linalg.norm(qry, axis=1, keepdims=True)
     ref[18] = ref[1]
     ranked, scores = topk(ref, qry, 30, query_chunk=3, reference_chunk=4)
-    expected = np.argsort(-(qry @ ref.T), axis=1, kind="stable")
-    np.testing.assert_array_equal(ranked, expected)
-    np.testing.assert_allclose(scores, np.take_along_axis(qry @ ref.T, expected, axis=1), atol=1e-6)
+    similarity = qry @ ref.T
+    expected = np.argsort(-similarity, axis=1, kind="stable")
+    # Chunked matmul is not bit-identical to the unchunked product, so duplicate
+    # descriptors can land an ULP apart and swap. Compare score plateaus, not exact order.
+    for row, want in enumerate(expected):
+        plateau = np.cumsum(np.diff(similarity[row, want], prepend=np.inf) < -1e-6)
+        for group in np.unique(plateau):
+            assert set(ranked[row, plateau == group]) == set(want[plateau == group])
+    assert (np.diff(scores, axis=1) <= 0).all()
+    np.testing.assert_allclose(scores, np.take_along_axis(similarity, ranked, axis=1), atol=1e-6)
     tied, _ = topk(np.ones((15, 2), "float32"), np.ones((2, 2), "float32"), 5, reference_chunk=2)
     np.testing.assert_array_equal(tied, np.tile(np.arange(5), (2, 1)))
 
