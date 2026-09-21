@@ -57,5 +57,13 @@ is not documented yet.
 If you use our work, please cite the following paper:
 
 ```bibtex
-
+@misc{hines2026megaevent,
+      title={Multi-viewpoint Geo-localization with Event Cameras}, 
+      author={Adam D. Hines and Michael Milford and Tobias Fischer},
+      year={2026},
+      eprint={2609.21219},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2609.21219}, 
+}
 ```
