@@ -6,7 +6,7 @@ This repository contains the evaluation and training code for MegaEvent, our sta
 <img src="assets/megaevent.png" width="1200">
 </p>
 
-[ArXiv Paper]() &bull; [Pre-trained models](https://huggingface.co/AdamHines/megaevent) &bull; [Springfield-Event-VPR dataset](https://huggingface.co/datasets/AdamHines/springfield-event-vpr)
+[ArXiv Paper](https://arxiv.org/abs/2609.21219) &bull; [Pre-trained models](https://huggingface.co/AdamHines/megaevent) &bull; [Springfield-Event-VPR dataset](https://huggingface.co/datasets/AdamHines/springfield-event-vpr)
 
 ## Install
 
